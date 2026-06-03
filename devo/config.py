@@ -23,6 +23,7 @@ _C.PATCH_LIFETIME = 9
 _C.EDGE_THINNING = False
 _C.EDGE_THIN_DENSE_WINDOW = 3
 _C.EDGE_THIN_STRIDE = 2
+_C.CORR_SINGLE_LEVEL = True
 
 # Active-to-frozen edge marginalization. Frozen edges skip corr/update and keep
 # contributing their last target and confidence directly to BA.
