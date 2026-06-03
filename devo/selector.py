@@ -5,7 +5,10 @@ import torch.distributions.gumbel as gumbel
 import numpy as np
 import enum
 
-from torchvision.ops import batched_nms
+try:
+    from torchvision.ops import batched_nms
+except ModuleNotFoundError:
+    batched_nms = None
 from . import altcorr
 
 
@@ -55,6 +58,7 @@ class PatchSelector():
         self.KERNEL_SIZE = 4
         self.NMS_RADIUS = 1.5
         self.NMS_IOU = 0.4
+        self.NMS_CANDIDATE_FACTOR = 4
         
     def _grid(self, scores):
         b, n, h1, w1 = scores.shape
@@ -190,6 +194,51 @@ class PatchSelector():
         y = self.KERNEL_SIZE * y + offset_y
         
         return (x,y)
+
+    def _diverse_topk(self, scores, patches_per_image):
+        """deterministic top-k with local spatial diversity.
+
+        This keeps the same scorer objective as topk, but first applies local
+        max suppression on the score map. It avoids selecting many adjacent
+        patches on the same high-response structure, which gives BA/update a
+        better-conditioned set of constraints for the same or smaller budget.
+        """
+        b, n, h, w = scores.shape
+        bn = b * n
+        flat_scores = scores.view(bn, 1, h, w)
+
+        radius = int(max(self.NMS_RADIUS, 1))
+        kernel = 2 * radius + 1
+        pooled = F.max_pool2d(flat_scores, kernel_size=kernel, stride=1, padding=radius)
+        keep = flat_scores == pooled
+
+        suppressed = flat_scores.masked_fill(~keep, -torch.inf).view(bn, -1)
+        k = min(patches_per_image, suppressed.shape[-1])
+        vals, idx = torch.topk(suppressed, k, dim=-1)
+
+        if k < patches_per_image or torch.isinf(vals).any():
+            fallback_k = min(
+                max(patches_per_image * self.NMS_CANDIDATE_FACTOR, patches_per_image),
+                suppressed.shape[-1])
+            _, fallback = torch.topk(scores.view(bn, -1), fallback_k, dim=-1)
+            idx = self._fill_diverse_indices(idx, vals, fallback, patches_per_image)
+
+        x = idx % w
+        y = torch.div(idx, w, rounding_mode='floor')
+        return (x, y)
+
+    def _fill_diverse_indices(self, idx, vals, fallback, patches_per_image):
+        """Fill rare NMS underflows with ordinary top-k candidates."""
+        rows = []
+        for r in range(idx.shape[0]):
+            valid = idx[r][torch.isfinite(vals[r])]
+            merged = torch.cat([valid, fallback[r]])
+            unique = torch.unique(merged, sorted=False)
+            if len(unique) < patches_per_image:
+                repeats = fallback[r][:patches_per_image - len(unique)]
+                unique = torch.cat([unique, repeats])
+            rows.append(unique[:patches_per_image])
+        return torch.stack(rows, dim=0)
     
     def _nms(self, scores, patches_per_image):
         """ pooled nms sampling
@@ -200,6 +249,9 @@ class PatchSelector():
         Returns:
             (tensor,tensor): Tuple((b*n,patches_per_image),(b*n,patches_per_image)) x,y coords
         """
+        if batched_nms is None:
+            raise ImportError("torchvision is required for PatchSelector('nms')")
+
         b, n, h, w = scores.shape
         # 1) max pooling (with indices)
         max_scores, max_idx = F.max_pool2d(scores, kernel_size=self.KERNEL_SIZE, stride=self.KERNEL_SIZE, return_indices=True) # (b,n,h1,w1)
@@ -284,4 +336,3 @@ class PatchSelector():
         x = (x - padding_w_left).clamp(min=0, max=w-1)
         y = (y - padding_h_top).clamp(min=0, max=h-1)
         return (x,y)
-
