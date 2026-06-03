@@ -556,11 +556,13 @@ class DEVO:
 
     def ba_factors(self, target=None, weight=None):
         use_frozen = getattr(self.cfg, "MARGINALIZE_USE_FROZEN_IN_BA", True)
+        frozen_weight_scale = getattr(self.cfg, "MARGINALIZE_FROZEN_BA_WEIGHT", 1.0)
         if target is None:
             if len(self.ii) == 0:
                 if not use_frozen:
                     return self.ii, self.jj, self.kk, self.active_target, self.active_weight
-                return self.marg_ii, self.marg_jj, self.marg_kk, self.marg_target, self.marg_weight * self.marg_weight_scale
+                return self.marg_ii, self.marg_jj, self.marg_kk, self.marg_target, \
+                    self.marg_weight * self.marg_weight_scale * frozen_weight_scale
             target = self.active_target
             weight = self.active_weight
 
@@ -571,7 +573,8 @@ class DEVO:
         jj = torch.cat([self.jj, self.marg_jj])
         kk = torch.cat([self.kk, self.marg_kk])
         target = torch.cat([target.float(), self.marg_target], dim=1)
-        weight = torch.cat([weight.float(), self.marg_weight * self.marg_weight_scale], dim=1)
+        marg_weight = self.marg_weight * self.marg_weight_scale * frozen_weight_scale
+        weight = torch.cat([weight.float(), marg_weight], dim=1)
         return ii, jj, kk, target, weight
 
     def motion_probe(self):
