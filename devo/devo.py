@@ -91,6 +91,7 @@ class DEVO:
         self.kk = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.active_target = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
         self.active_weight = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
+        self.active_delta = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
         self.active_confidence = torch.as_tensor([], dtype=torch.float, device="cuda")
         self.active_delta_norm = torch.as_tensor([], dtype=torch.float, device="cuda")
         self.active_keepalive = torch.as_tensor([], dtype=torch.long, device="cuda")
@@ -98,6 +99,7 @@ class DEVO:
         self.marg_jj = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_kk = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_target = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
+        self.marg_delta = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
         self.marg_weight = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
         self.marg_weight_scale = torch.zeros(1, 0, 1, dtype=torch.float, device="cuda")
         self.marginalize_update_count = 0
@@ -309,6 +311,9 @@ class DEVO:
         self.active_weight = torch.cat([
             self.active_weight,
             torch.zeros(1, len(ii), 2, dtype=torch.float, device="cuda")], dim=1)
+        self.active_delta = torch.cat([
+            self.active_delta,
+            torch.zeros(1, len(ii), 2, dtype=torch.float, device="cuda")], dim=1)
         self.active_confidence = torch.cat([
             self.active_confidence,
             torch.zeros(len(ii), dtype=torch.float, device="cuda")])
@@ -326,6 +331,7 @@ class DEVO:
         self.net = self.net[:,~m]
         self.active_target = self.active_target[:,~m]
         self.active_weight = self.active_weight[:,~m]
+        self.active_delta = self.active_delta[:,~m]
         self.active_confidence = self.active_confidence[~m]
         self.active_delta_norm = self.active_delta_norm[~m]
         self.active_keepalive = self.active_keepalive[~m]
@@ -335,6 +341,7 @@ class DEVO:
         self.marg_jj = self.marg_jj[~m]
         self.marg_kk = self.marg_kk[~m]
         self.marg_target = self.marg_target[:,~m]
+        self.marg_delta = self.marg_delta[:,~m]
         self.marg_weight = self.marg_weight[:,~m]
         self.marg_weight_scale = self.marg_weight_scale[:,~m]
 
@@ -358,6 +365,7 @@ class DEVO:
         self.marg_jj = torch.cat([self.marg_jj, self.jj[m]])
         self.marg_kk = torch.cat([self.marg_kk, self.kk[m]])
         self.marg_target = torch.cat([self.marg_target, target[:,m].detach().float()], dim=1)
+        self.marg_delta = torch.cat([self.marg_delta, self.active_delta[:,m].detach().float()], dim=1)
         self.marg_weight = torch.cat([self.marg_weight, weight[:,m].detach().float()], dim=1)
         scale = torch.ones(1, m.sum().item(), 1, dtype=torch.float, device="cuda")
         self.marg_weight_scale = torch.cat([self.marg_weight_scale, scale], dim=1)
@@ -379,6 +387,7 @@ class DEVO:
         weight = self.marg_weight[:,m] * self.marg_weight_scale[:,m]
         self.active_target = torch.cat([self.active_target, self.marg_target[:,m]], dim=1)
         self.active_weight = torch.cat([self.active_weight, weight], dim=1)
+        self.active_delta = torch.cat([self.active_delta, self.marg_delta[:,m]], dim=1)
         self.active_confidence = torch.cat([
             self.active_confidence,
             weight[0].mean(dim=-1).float()])
@@ -540,7 +549,8 @@ class DEVO:
 
         coords = self.reproject(indicies=(self.marg_ii, self.marg_jj, self.marg_kk))
         current = coords[...,self.P//2,self.P//2]
-        residual = (self.marg_target - current).norm(dim=-1)[0]
+        target = current + self.marg_delta if getattr(self.cfg, "MARGINALIZE_REFRESH_TARGETS", False) else self.marg_target
+        residual = (target - current).norm(dim=-1)[0]
         soft_residual = getattr(self.cfg, "MARGINALIZE_SOFT_FROZEN_RESIDUAL", 2.0)
         max_residual = getattr(self.cfg, "MARGINALIZE_MAX_FROZEN_RESIDUAL", 8.0)
         min_scale = getattr(self.cfg, "MARGINALIZE_MIN_FROZEN_WEIGHT_SCALE", 0.2)
@@ -596,11 +606,13 @@ class DEVO:
     def ba_factors(self, target=None, weight=None):
         use_frozen = getattr(self.cfg, "MARGINALIZE_USE_FROZEN_IN_BA", True)
         frozen_weight_scale = getattr(self.cfg, "MARGINALIZE_FROZEN_BA_WEIGHT", 1.0)
+        refresh_frozen = getattr(self.cfg, "MARGINALIZE_REFRESH_TARGETS", False)
         if target is None:
             if len(self.ii) == 0:
                 if not use_frozen:
                     return self.ii, self.jj, self.kk, self.active_target, self.active_weight
-                return self.marg_ii, self.marg_jj, self.marg_kk, self.marg_target, \
+                marg_target = self.refreshed_marginalized_targets() if refresh_frozen else self.marg_target
+                return self.marg_ii, self.marg_jj, self.marg_kk, marg_target, \
                     self.marg_weight * self.marg_weight_scale * frozen_weight_scale
             target = self.active_target
             weight = self.active_weight
@@ -608,13 +620,22 @@ class DEVO:
         if len(self.marg_ii) == 0 or not use_frozen:
             return self.ii, self.jj, self.kk, target.float(), weight.float()
 
+        marg_target = self.refreshed_marginalized_targets() if refresh_frozen else self.marg_target
         ii = torch.cat([self.ii, self.marg_ii])
         jj = torch.cat([self.jj, self.marg_jj])
         kk = torch.cat([self.kk, self.marg_kk])
-        target = torch.cat([target.float(), self.marg_target], dim=1)
+        target = torch.cat([target.float(), marg_target], dim=1)
         marg_weight = self.marg_weight * self.marg_weight_scale * frozen_weight_scale
         weight = torch.cat([weight.float(), marg_weight], dim=1)
         return ii, jj, kk, target, weight
+
+    def refreshed_marginalized_targets(self):
+        if len(self.marg_ii) == 0:
+            return self.marg_target
+
+        coords = self.reproject(indicies=(self.marg_ii, self.marg_jj, self.marg_kk))
+        current = coords[...,self.P//2,self.P//2]
+        return current + self.marg_delta
 
     def motion_probe(self):
         """ kinda hacky way to ensure enough motion for initialization """
@@ -728,6 +749,7 @@ class DEVO:
 
                 self.active_target[:,neural] = target.detach().float()
                 self.active_weight[:,neural] = weight.detach().float()
+                self.active_delta[:,neural] = delta.detach().float()
                 self.active_confidence[neural] = confidence.detach().float()
                 self.active_delta_norm[neural] = delta_norm.detach().float()
                 self.update_active_budget(confidence, delta_norm)
