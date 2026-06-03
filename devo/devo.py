@@ -93,6 +93,7 @@ class DEVO:
         self.active_weight = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
         self.active_confidence = torch.as_tensor([], dtype=torch.float, device="cuda")
         self.active_delta_norm = torch.as_tensor([], dtype=torch.float, device="cuda")
+        self.active_keepalive = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_ii = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_jj = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_kk = torch.as_tensor([], dtype=torch.long, device="cuda")
@@ -256,6 +257,9 @@ class DEVO:
         self.active_delta_norm = torch.cat([
             self.active_delta_norm,
             torch.full((len(ii),), torch.inf, dtype=torch.float, device="cuda")])
+        self.active_keepalive = torch.cat([
+            self.active_keepalive,
+            torch.zeros(len(ii), dtype=torch.long, device="cuda")])
 
     def remove_factors(self, m):
         self.ii = self.ii[~m]
@@ -266,6 +270,7 @@ class DEVO:
         self.active_weight = self.active_weight[:,~m]
         self.active_confidence = self.active_confidence[~m]
         self.active_delta_norm = self.active_delta_norm[~m]
+        self.active_keepalive = self.active_keepalive[~m]
 
     def remove_marginalized_factors(self, m):
         self.marg_ii = self.marg_ii[~m]
@@ -296,6 +301,34 @@ class DEVO:
         self.marg_weight_scale = torch.cat([self.marg_weight_scale, scale], dim=1)
         self.remove_factors(m)
         self.prune_marginalized_factors()
+
+    def reactivate_marginalized_factors(self, m):
+        if m.sum().item() == 0:
+            return
+
+        num = m.sum().item()
+        self.ii = torch.cat([self.ii, self.marg_ii[m]])
+        self.jj = torch.cat([self.jj, self.marg_jj[m]])
+        self.kk = torch.cat([self.kk, self.marg_kk[m]])
+
+        net = torch.zeros(1, num, self.dim_inet, **self.kwargs)
+        self.net = torch.cat([self.net, net], dim=1)
+
+        weight = self.marg_weight[:,m] * self.marg_weight_scale[:,m]
+        self.active_target = torch.cat([self.active_target, self.marg_target[:,m]], dim=1)
+        self.active_weight = torch.cat([self.active_weight, weight], dim=1)
+        self.active_confidence = torch.cat([
+            self.active_confidence,
+            weight[0].mean(dim=-1).float()])
+        self.active_delta_norm = torch.cat([
+            self.active_delta_norm,
+            torch.full((num,), torch.inf, dtype=torch.float, device="cuda")])
+
+        keepalive = getattr(self.cfg, "MARGINALIZE_REACTIVATE_KEEPALIVE", 2)
+        self.active_keepalive = torch.cat([
+            self.active_keepalive,
+            torch.full((num,), keepalive, dtype=torch.long, device="cuda")])
+        self.remove_marginalized_factors(m)
 
     def current_active_budget(self):
         if not getattr(self.cfg, "MARGINALIZE_ADAPTIVE_BUDGET", False):
@@ -366,22 +399,34 @@ class DEVO:
         core_window = getattr(self.cfg, "MARGINALIZE_CORE_WINDOW", 4)
         max_active_edges = self.current_active_budget()
         force_budget = getattr(self.cfg, "MARGINALIZE_FORCE_BUDGET", False)
-        force_delta_thresh = getattr(self.cfg, "MARGINALIZE_FORCE_DELTA_THRESH", 1.0)
+        force_delta_thresh = getattr(self.cfg, "MARGINALIZE_FORCE_DELTA_THRESH", 10.0)
         freeze_delta_weight = getattr(self.cfg, "MARGINALIZE_FREEZE_DELTA_WEIGHT", 1.0)
         protect_delta_thresh = getattr(self.cfg, "MARGINALIZE_PROTECT_DELTA_THRESH", 0.75)
         protect_conf_thresh = getattr(self.cfg, "MARGINALIZE_PROTECT_CONF_THRESH", 0.45)
         coverage_stride = getattr(self.cfg, "MARGINALIZE_COVERAGE_STRIDE", 0)
+        coverage_penalty = getattr(self.cfg, "MARGINALIZE_COVERAGE_PENALTY", 0.75)
+        age_weight = getattr(self.cfg, "MARGINALIZE_AGE_WEIGHT", 0.02)
 
         patch_frame = self.ix[self.kk]
         newest_core = max(self.n - core_window, 0)
 
         old_enough = patch_frame <= self.n - min_age
         outside_core = (self.ii < newest_core) & (self.jj < newest_core)
-        candidates = old_enough & outside_core
-        protected = (delta_norm >= protect_delta_thresh) | (confidence <= protect_conf_thresh)
+        fresh = torch.isinf(delta_norm) | (self.active_weight[0].mean(dim=-1) <= 0)
+        finite = torch.isfinite(delta_norm) & torch.isfinite(confidence)
+        reusable = self.active_keepalive <= 0
+        candidates = old_enough & outside_core & reusable & (~fresh) & finite
+        protected = torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
 
+        if protect_delta_thresh > 0:
+            protected |= delta_norm >= protect_delta_thresh
+
+        if protect_conf_thresh > 0:
+            protected |= confidence <= protect_conf_thresh
+
+        coverage_anchor = torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
         if coverage_stride > 1:
-            protected |= ((self.kk % coverage_stride) == 0)
+            coverage_anchor = (self.kk % coverage_stride) == 0
 
         converged = (confidence >= weight_thresh) & \
             (delta_norm <= delta_thresh) & candidates & (~protected)
@@ -391,7 +436,7 @@ class DEVO:
 
         num_to_freeze = len(self.ii) - max_active_edges
         if force_budget:
-            freeze_pool = candidates & (~protected) & (delta_norm <= force_delta_thresh)
+            freeze_pool = candidates & (delta_norm <= force_delta_thresh)
         else:
             freeze_pool = converged & (~protected)
 
@@ -399,7 +444,10 @@ class DEVO:
         if num_to_freeze <= 0:
             return torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
 
-        score = confidence - freeze_delta_weight * delta_norm
+        age = (self.n - patch_frame).float()
+        score = confidence - freeze_delta_weight * delta_norm + age_weight * age
+        score = score - coverage_penalty * coverage_anchor.float()
+        score = score - 10.0 * protected.float()
         score = score.masked_fill(~freeze_pool, -torch.inf)
         _, freeze_idx = torch.topk(score, k=num_to_freeze)
 
@@ -434,6 +482,23 @@ class DEVO:
             self.marg_weight_scale = scale.view(1, -1, 1)
 
         stale = (~torch.isfinite(residual)) | (residual > max_residual)
+
+        if getattr(self.cfg, "MARGINALIZE_REACTIVATE_FROZEN", False):
+            reactivate_residual = getattr(self.cfg, "MARGINALIZE_REACTIVATE_RESIDUAL", 4.0)
+            max_reactivate = getattr(self.cfg, "MARGINALIZE_MAX_REACTIVATE", 128)
+            reactivate_pool = torch.isfinite(residual) & \
+                (residual > reactivate_residual) & \
+                (residual <= max_residual)
+
+            num_reactivate = min(max_reactivate, reactivate_pool.sum().item())
+            if num_reactivate > 0:
+                score = residual.masked_fill(~reactivate_pool, -torch.inf)
+                _, reactivate_idx = torch.topk(score, k=num_reactivate)
+                reactivate = torch.zeros(len(self.marg_ii), dtype=torch.bool, device="cuda")
+                reactivate[reactivate_idx] = True
+                self.reactivate_marginalized_factors(reactivate)
+                stale = stale[~reactivate]
+
         if stale.any():
             self.remove_marginalized_factors(stale)
 
@@ -587,6 +652,9 @@ class DEVO:
             to_marginalize = self.select_marginalized_factors(
                 self.active_confidence, self.active_delta_norm)
             self.marginalize_factors(to_marginalize, self.active_target, self.active_weight)
+
+        if self.active_keepalive.numel() > 0:
+            self.active_keepalive = torch.clamp(self.active_keepalive - 1, min=0)
 
         # Decay frozen edge weights so stale targets fade out gracefully.
         if self.marg_weight.numel() > 0:
