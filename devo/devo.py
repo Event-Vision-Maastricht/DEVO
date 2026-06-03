@@ -460,6 +460,42 @@ class DEVO:
         neural[skip_idx] = False
         return neural
 
+    def select_adaptive_neural_factors(self):
+        base = self.select_neural_factors()
+        if not getattr(self.cfg, "ADAPTIVE_UPDATE_ENABLED", False) or len(self.ii) == 0:
+            return base
+
+        interval = max(getattr(self.cfg, "ADAPTIVE_FULL_UPDATE_INTERVAL", 2), 1)
+        if interval <= 1 or self.marginalize_update_count % interval == 0:
+            return base
+
+        fresh = torch.isinf(self.active_delta_norm) | (self.active_weight[0].mean(dim=-1) <= 0)
+
+        core_window = getattr(self.cfg, "ADAPTIVE_UPDATE_CORE_WINDOW", 1)
+        newest_core = max(self.n - core_window, 0)
+        core = (self.ii >= newest_core) | (self.jj >= newest_core)
+
+        hard_delta = getattr(self.cfg, "ADAPTIVE_UPDATE_DELTA_THRESH", 0.75)
+        hard_conf = getattr(self.cfg, "ADAPTIVE_UPDATE_CONF_THRESH", 0.45)
+        hard = torch.isfinite(self.active_delta_norm) & \
+            ((self.active_delta_norm >= hard_delta) | (self.active_confidence <= hard_conf))
+
+        neural = base & (fresh | core | hard)
+        min_edges = getattr(self.cfg, "ADAPTIVE_UPDATE_MIN_EDGES", 0)
+        if min_edges <= 0 or neural.sum().item() >= min_edges:
+            return neural
+
+        num_to_add = min(min_edges - neural.sum().item(), (base & (~neural)).sum().item())
+        if num_to_add <= 0:
+            return neural
+
+        score = self.active_delta_norm.float() - self.active_confidence.float()
+        score = torch.where(torch.isfinite(score), score, torch.zeros_like(score))
+        score = score.masked_fill(~(base & (~neural)), -torch.inf)
+        _, add_idx = torch.topk(score, k=num_to_add)
+        neural[add_idx] = True
+        return neural
+
     def select_marginalized_factors(self, confidence, delta_norm, enforce_budget=False):
         if not self.marginalization_enabled() or len(self.ii) == 0:
             return torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
@@ -725,7 +761,7 @@ class DEVO:
         self.print_marginalization_stats()
 
         if len(self.ii) > 0:
-            neural = self.select_neural_factors()
+            neural = self.select_adaptive_neural_factors()
             if neural.any():
                 ii = self.ii[neural]
                 jj = self.jj[neural]
