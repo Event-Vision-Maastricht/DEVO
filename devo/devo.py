@@ -757,7 +757,7 @@ class DEVO:
         net = torch.zeros(1, len(ii), self.dim_inet, **self.kwargs)
         coords = self.reproject(indicies=(ii, jj, kk))
 
-        with torch.no_grad():
+        with torch.inference_mode():
             with autocast(enabled=self.cfg.MIXED_PRECISION):
                 corr = self.corr(coords, indicies=(kk, jj))
                 ctx = self.imap[:,kk % (self.M * self.mem)]
@@ -841,7 +841,7 @@ class DEVO:
                 ii = self.ii[neural]
                 jj = self.jj[neural]
                 kk = self.kk[neural]
-                with torch.no_grad():
+                with torch.inference_mode():
                     coords = self.reproject(indicies=(ii, jj, kk))
 
                     with autocast(enabled=True):
@@ -1045,7 +1045,7 @@ class DEVO:
         # plt.show()
 
         # TODO patches with depth is available (val)
-        with torch.no_grad():
+        with torch.inference_mode():
             with autocast(enabled=self.cfg.MIXED_PRECISION):
                 fmap, gmap, imap, patches, _, clr = \
                     self.network.patchify(image,
