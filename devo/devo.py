@@ -209,6 +209,7 @@ class DEVO:
             poses = [self.get_pose(t) for t in range(self.counter)]
             poses = lietorch.stack(poses, dim=0)
             poses = poses.inv().data.cpu().numpy()
+            poses = self.smooth_trajectory(poses)
         else:
             print(f"Warning: Model is not initialized. Using Identity.") # eval still runs bug
             id = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
@@ -221,6 +222,35 @@ class DEVO:
             self.viewer.join()
 
         return poses, tstamps
+
+    def smooth_trajectory(self, poses):
+        if not getattr(self.cfg, "TRAJECTORY_SMOOTHING", False) or len(poses) < 3:
+            return poses
+
+        alpha = getattr(self.cfg, "TRAJECTORY_SMOOTHING_ALPHA", 0.25)
+        passes = max(getattr(self.cfg, "TRAJECTORY_SMOOTHING_PASSES", 1), 1)
+        alpha = min(max(alpha, 0.0), 0.5)
+        smoothed = poses.copy()
+
+        for _ in range(passes):
+            prev = smoothed[:-2]
+            curr = smoothed[1:-1]
+            nxt = smoothed[2:]
+
+            out = smoothed.copy()
+            out[1:-1, :3] = alpha * prev[:, :3] + (1.0 - 2.0 * alpha) * curr[:, :3] + alpha * nxt[:, :3]
+
+            qprev = prev[:, 3:7]
+            qcurr = curr[:, 3:7]
+            qnext = nxt[:, 3:7]
+            qprev = np.where((qprev * qcurr).sum(axis=1, keepdims=True) < 0, -qprev, qprev)
+            qnext = np.where((qnext * qcurr).sum(axis=1, keepdims=True) < 0, -qnext, qnext)
+            q = alpha * qprev + (1.0 - 2.0 * alpha) * qcurr + alpha * qnext
+            q = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-8)
+            out[1:-1, 3:7] = q
+            smoothed = out
+
+        return smoothed
 
     def final_refine(self):
         if not self.is_initialized or not getattr(self.cfg, "FINAL_BA_ENABLED", False):
