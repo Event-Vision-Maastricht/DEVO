@@ -368,6 +368,9 @@ class DEVO:
         force_budget = getattr(self.cfg, "MARGINALIZE_FORCE_BUDGET", False)
         force_delta_thresh = getattr(self.cfg, "MARGINALIZE_FORCE_DELTA_THRESH", 1.0)
         freeze_delta_weight = getattr(self.cfg, "MARGINALIZE_FREEZE_DELTA_WEIGHT", 1.0)
+        protect_delta_thresh = getattr(self.cfg, "MARGINALIZE_PROTECT_DELTA_THRESH", 0.75)
+        protect_conf_thresh = getattr(self.cfg, "MARGINALIZE_PROTECT_CONF_THRESH", 0.45)
+        coverage_stride = getattr(self.cfg, "MARGINALIZE_COVERAGE_STRIDE", 0)
 
         patch_frame = self.ix[self.kk]
         newest_core = max(self.n - core_window, 0)
@@ -375,16 +378,22 @@ class DEVO:
         old_enough = patch_frame <= self.n - min_age
         outside_core = (self.ii < newest_core) & (self.jj < newest_core)
         candidates = old_enough & outside_core
-        converged = (confidence >= weight_thresh) & (delta_norm <= delta_thresh) & candidates
+        protected = (delta_norm >= protect_delta_thresh) | (confidence <= protect_conf_thresh)
+
+        if coverage_stride > 1:
+            protected |= ((self.kk % coverage_stride) == 0)
+
+        converged = (confidence >= weight_thresh) & \
+            (delta_norm <= delta_thresh) & candidates & (~protected)
 
         if not enforce_budget or max_active_edges <= 0 or len(self.ii) <= max_active_edges:
             return converged
 
         num_to_freeze = len(self.ii) - max_active_edges
         if force_budget:
-            freeze_pool = candidates & (delta_norm <= force_delta_thresh)
+            freeze_pool = candidates & (~protected) & (delta_norm <= force_delta_thresh)
         else:
-            freeze_pool = converged
+            freeze_pool = converged & (~protected)
 
         num_to_freeze = min(num_to_freeze, freeze_pool.sum().item())
         if num_to_freeze <= 0:
@@ -401,8 +410,7 @@ class DEVO:
     def marginalize_cached_factors(self):
         to_marginalize = self.select_marginalized_factors(
             self.active_confidence, self.active_delta_norm, enforce_budget=True)
-        if to_marginalize.any():
-            self.marginalize_factors(to_marginalize, self.active_target, self.active_weight)
+        self.marginalize_factors(to_marginalize, self.active_target, self.active_weight)
 
     def validate_marginalized_factors(self):
         if not getattr(self.cfg, "MARGINALIZE_VALIDATE_FROZEN", True) or len(self.marg_ii) == 0:
@@ -578,8 +586,7 @@ class DEVO:
 
             to_marginalize = self.select_marginalized_factors(
                 self.active_confidence, self.active_delta_norm)
-            if to_marginalize.any():
-                self.marginalize_factors(to_marginalize, self.active_target, self.active_weight)
+            self.marginalize_factors(to_marginalize, self.active_target, self.active_weight)
 
         # Decay frozen edge weights so stale targets fade out gracefully.
         if self.marg_weight.numel() > 0:
