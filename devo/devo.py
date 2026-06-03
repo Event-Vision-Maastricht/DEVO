@@ -107,6 +107,8 @@ class DEVO:
         self.marginalize_freeze_cooldown = 0
         self.active_edge_budget = getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", 0)
         self.neural_edge_budget = getattr(self.cfg, "WARM_BASE_NEURAL_EDGES", 0)
+        self.graph_version = 0
+        self.update_topology_cache = {}
         
         # initialize poses to identity matrix
         self.poses_[:,6] = 1.0
@@ -187,15 +189,72 @@ class DEVO:
 
         return scalar
 
-    def run_update_net(self, net, ctx, corr, flow, ii, jj, kk):
+    def bump_graph_version(self):
+        self.graph_version += 1
+        self.update_topology_cache = {}
+
+    def update_topology(self, ii, jj, kk, cacheable=False):
+        if not getattr(self.cfg, "UPDATE_TOPOLOGY_CACHE", False):
+            return None
+
+        key = None
+        if cacheable:
+            key = (self.graph_version, len(ii), ii.data_ptr(), jj.data_ptr(), kk.data_ptr())
+            cached = self.update_topology_cache.get(key)
+            if cached is not None:
+                return cached
+
+        ix, jx = self.temporal_neighbors(kk, jj)
+        _, kk_group = torch.unique(kk, return_inverse=True)
+        _, ij_group = torch.unique(ii * 12345 + jj, return_inverse=True)
+        topology = {
+            "ix": ix,
+            "jx": jx,
+            "kk_group": kk_group,
+            "ij_group": ij_group,
+        }
+
+        if key is not None:
+            self.update_topology_cache[key] = topology
+
+        return topology
+
+    def temporal_neighbors(self, kk, jj):
+        if not getattr(self.cfg, "UPDATE_GPU_TOPOLOGY", True) or len(kk) == 0:
+            return fastba.neighbors(kk, jj)
+
         try:
-            return self.update_op(net, ctx, corr, flow, ii, jj, kk)
+            key_stride = max(getattr(self.cfg, "BUFFER_SIZE", self.N), self.N) + 1
+            edge_stride = len(kk) + 1
+            edge_order = torch.arange(len(kk), dtype=kk.dtype, device=kk.device)
+            order = torch.argsort((kk * key_stride + jj) * edge_stride + edge_order)
+            kk_sorted = kk[order]
+
+            prev_sorted = torch.full_like(order, -1)
+            next_sorted = torch.full_like(order, -1)
+
+            if len(order) > 1:
+                same_prev = kk_sorted[1:] == kk_sorted[:-1]
+                prev_sorted[1:] = torch.where(same_prev, order[:-1], prev_sorted[1:])
+                next_sorted[:-1] = torch.where(same_prev, order[1:], next_sorted[:-1])
+
+            ix = torch.empty_like(order)
+            jx = torch.empty_like(order)
+            ix[order] = prev_sorted
+            jx[order] = next_sorted
+            return ix, jx
+        except TypeError:
+            return fastba.neighbors(kk, jj)
+
+    def run_update_net(self, net, ctx, corr, flow, ii, jj, kk, topology=None):
+        try:
+            return self.update_op(net, ctx, corr, flow, ii, jj, kk, topology)
         except Exception as e:
             if self.update_op_compiled and getattr(self.cfg, "COMPILE_UPDATE_FALLBACK", True):
                 print(f"Warning: compiled update_net failed; falling back ({e})")
                 self.update_op = self.network.update
                 self.update_op_compiled = False
-                return self.update_op(net, ctx, corr, flow, ii, jj, kk)
+                return self.update_op(net, ctx, corr, flow, ii, jj, kk, topology)
             raise
 
 
@@ -346,6 +405,7 @@ class DEVO:
         self.jj = torch.cat([self.jj, jj])
         self.kk = torch.cat([self.kk, ii])
         self.ii = torch.cat([self.ii, self.ix[ii]]) 
+        self.bump_graph_version()
         # TODO: self.ix.shape = self.M*self.N
         # self.ix is filled dynamically
 
@@ -381,6 +441,8 @@ class DEVO:
         self.active_confidence = self.active_confidence[~m]
         self.active_delta_norm = self.active_delta_norm[~m]
         self.active_keepalive = self.active_keepalive[~m]
+        if m.any():
+            self.bump_graph_version()
 
     def remove_marginalized_factors(self, m):
         self.marg_ii = self.marg_ii[~m]
@@ -426,6 +488,7 @@ class DEVO:
         self.ii = torch.cat([self.ii, self.marg_ii[m]])
         self.jj = torch.cat([self.jj, self.marg_jj[m]])
         self.kk = torch.cat([self.kk, self.marg_kk[m]])
+        self.bump_graph_version()
 
         net = torch.zeros(1, num, self.dim_inet, **self.kwargs)
         self.net = torch.cat([self.net, net], dim=1)
@@ -809,6 +872,7 @@ class DEVO:
             self.marg_kk[self.marg_ii > k] -= self.M
             self.marg_ii[self.marg_ii > k] -= 1
             self.marg_jj[self.marg_jj > k] -= 1
+            self.bump_graph_version()
 
             for i in range(k, self.n-1):
                 self.tstamps_[i] = self.tstamps_[i+1]
@@ -836,11 +900,15 @@ class DEVO:
         self.print_marginalization_stats()
 
         if len(self.ii) > 0:
-            neural = self.select_adaptive_neural_factors()
-            if neural.any():
-                ii = self.ii[neural]
-                jj = self.jj[neural]
-                kk = self.kk[neural]
+            all_neural = not getattr(self.cfg, "WARM_UPDATE_ENABLED", False) and \
+                not getattr(self.cfg, "ADAPTIVE_UPDATE_ENABLED", False)
+            neural = None if all_neural else self.select_adaptive_neural_factors()
+
+            if all_neural or neural.any():
+                ii = self.ii if all_neural else self.ii[neural]
+                jj = self.jj if all_neural else self.jj[neural]
+                kk = self.kk if all_neural else self.kk[neural]
+                net_in = self.net if all_neural else self.net[:,neural]
                 with torch.inference_mode():
                     coords = self.reproject(indicies=(ii, jj, kk))
 
@@ -848,21 +916,32 @@ class DEVO:
 
                         corr = self.corr(coords, indicies=(kk, jj))
                         ctx = self.imap[:,kk % (self.M * self.mem)]
+                        topology = self.update_topology(ii, jj, kk, cacheable=all_neural)
                         with Timer("other", enabled=self.enable_timing):
                             net, (delta, weight, _) = \
-                                self.run_update_net(self.net[:,neural], ctx, corr, None, ii, jj, kk)
+                                self.run_update_net(net_in, ctx, corr, None, ii, jj, kk, topology)
 
-                self.net[:,neural] = net
+                if all_neural:
+                    self.net = net
+                else:
+                    self.net[:,neural] = net
                 weight = weight.float()
                 target = coords[...,self.P//2,self.P//2] + delta.float()
                 confidence = weight[0].mean(dim=-1)
                 delta_norm = delta[0].float().norm(dim=-1)
 
-                self.active_target[:,neural] = target.detach().float()
-                self.active_weight[:,neural] = weight.detach().float()
-                self.active_delta[:,neural] = delta.detach().float()
-                self.active_confidence[neural] = confidence.detach().float()
-                self.active_delta_norm[neural] = delta_norm.detach().float()
+                if all_neural:
+                    self.active_target = target.detach().float()
+                    self.active_weight = weight.detach().float()
+                    self.active_delta = delta.detach().float()
+                    self.active_confidence = confidence.detach().float()
+                    self.active_delta_norm = delta_norm.detach().float()
+                else:
+                    self.active_target[:,neural] = target.detach().float()
+                    self.active_weight[:,neural] = weight.detach().float()
+                    self.active_delta[:,neural] = delta.detach().float()
+                    self.active_confidence[neural] = confidence.detach().float()
+                    self.active_delta_norm[neural] = delta_norm.detach().float()
                 self.update_active_budget(confidence, delta_norm)
 
             to_marginalize = self.select_marginalized_factors(

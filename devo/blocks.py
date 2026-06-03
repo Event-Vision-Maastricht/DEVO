@@ -37,8 +37,10 @@ class SoftAgg(nn.Module):
         self.g = nn.Linear(self.dim, self.dim)
         self.h = nn.Linear(self.dim, self.dim)
 
-    def forward(self, x, ix):
-        _, jx = torch.unique(ix, return_inverse=True)
+    def forward(self, x, ix, jx=None):
+        if jx is None:
+            _, jx = torch.unique(ix, return_inverse=True)
+
         w = torch_scatter.scatter_softmax(self.g(x), jx, dim=1)
         y = torch_scatter.scatter_sum(self.f(x) * w, jx, dim=1)
 
@@ -56,8 +58,10 @@ class SoftAggBasic(nn.Module):
         self.g = nn.Linear(self.dim,        1)
         self.h = nn.Linear(self.dim, self.dim)
 
-    def forward(self, x, ix):
-        _, jx = torch.unique(ix, return_inverse=True)
+    def forward(self, x, ix, jx=None):
+        if jx is None:
+            _, jx = torch.unique(ix, return_inverse=True)
+
         w = torch_scatter.scatter_softmax(self.g(x), jx, dim=1)
         y = torch_scatter.scatter_sum(self.f(x) * w, jx, dim=1)
 
