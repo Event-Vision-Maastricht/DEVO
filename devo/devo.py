@@ -468,6 +468,8 @@ class DEVO:
         coverage_stride = getattr(self.cfg, "MARGINALIZE_COVERAGE_STRIDE", 0)
         coverage_penalty = getattr(self.cfg, "MARGINALIZE_COVERAGE_PENALTY", 0.75)
         age_weight = getattr(self.cfg, "MARGINALIZE_AGE_WEIGHT", 0.02)
+        backbone_window = getattr(self.cfg, "MARGINALIZE_BACKBONE_WINDOW", 0)
+        backbone_penalty = getattr(self.cfg, "MARGINALIZE_BACKBONE_PENALTY", 0.0)
 
         patch_frame = self.ix[self.kk]
         newest_core = max(self.n - core_window, 0)
@@ -509,6 +511,9 @@ class DEVO:
         age = (self.n - patch_frame).float()
         score = confidence - freeze_delta_weight * delta_norm + age_weight * age
         score = score - coverage_penalty * coverage_anchor.float()
+        if backbone_window > 0 and backbone_penalty > 0:
+            temporal_backbone = (self.ii - self.jj).abs() <= backbone_window
+            score = score - backbone_penalty * temporal_backbone.float()
         score = score - 10.0 * protected.float()
         score = score.masked_fill(~freeze_pool, -torch.inf)
         _, freeze_idx = torch.topk(score, k=num_to_freeze)
