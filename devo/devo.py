@@ -316,6 +316,10 @@ class DEVO:
         if m.sum().item() == 0:
             return
 
+        if not getattr(self.cfg, "MARGINALIZE_USE_FROZEN_IN_BA", True):
+            self.remove_factors(m)
+            return
+
         self.marg_ii = torch.cat([self.marg_ii, self.ii[m]])
         self.marg_jj = torch.cat([self.marg_jj, self.jj[m]])
         self.marg_kk = torch.cat([self.marg_kk, self.kk[m]])
@@ -485,6 +489,9 @@ class DEVO:
         self.marginalize_factors(to_marginalize, self.active_target, self.active_weight)
 
     def validate_marginalized_factors(self):
+        if not getattr(self.cfg, "MARGINALIZE_USE_FROZEN_IN_BA", True):
+            return
+
         if not getattr(self.cfg, "MARGINALIZE_VALIDATE_FROZEN", True) or len(self.marg_ii) == 0:
             return
 
@@ -548,13 +555,16 @@ class DEVO:
             print(f"edges active={len(self.ii)} frozen={len(self.marg_ii)} active_budget={self.current_active_budget()} neural_budget={self.neural_edge_budget}")
 
     def ba_factors(self, target=None, weight=None):
+        use_frozen = getattr(self.cfg, "MARGINALIZE_USE_FROZEN_IN_BA", True)
         if target is None:
             if len(self.ii) == 0:
+                if not use_frozen:
+                    return self.ii, self.jj, self.kk, self.active_target, self.active_weight
                 return self.marg_ii, self.marg_jj, self.marg_kk, self.marg_target, self.marg_weight * self.marg_weight_scale
             target = self.active_target
             weight = self.active_weight
 
-        if len(self.marg_ii) == 0:
+        if len(self.marg_ii) == 0 or not use_frozen:
             return self.ii, self.jj, self.kk, target.float(), weight.float()
 
         ii = torch.cat([self.ii, self.marg_ii])
@@ -583,10 +593,15 @@ class DEVO:
 
     def motionmag(self, i, j):
         k = (self.ii == i) & (self.jj == j)
-        mk = (self.marg_ii == i) & (self.marg_jj == j)
-        ii = torch.cat([self.ii[k], self.marg_ii[mk]])
-        jj = torch.cat([self.jj[k], self.marg_jj[mk]])
-        kk = torch.cat([self.kk[k], self.marg_kk[mk]])
+        if getattr(self.cfg, "MARGINALIZE_USE_FROZEN_IN_BA", True):
+            mk = (self.marg_ii == i) & (self.marg_jj == j)
+            ii = torch.cat([self.ii[k], self.marg_ii[mk]])
+            jj = torch.cat([self.jj[k], self.marg_jj[mk]])
+            kk = torch.cat([self.kk[k], self.marg_kk[mk]])
+        else:
+            ii = self.ii[k]
+            jj = self.jj[k]
+            kk = self.kk[k]
 
         if len(ii) == 0:
             return float("inf")
