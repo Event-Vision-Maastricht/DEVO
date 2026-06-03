@@ -11,6 +11,7 @@ from .lietorch import SE3
 from .enet import eVONet
 from .utils import *
 from . import projective_ops as pops
+from .blocks import SoftAggBasic
 
 autocast = torch.cuda.amp.autocast
 Id = SE3.Identity(1, device="cuda")
@@ -147,6 +148,7 @@ class DEVO:
 
         self.network.cuda()
         self.network.eval()
+        self.configure_update_aggregation()
         self.network.requires_grad_(False)
         self.update_op = self.network.update
         self.update_op_compiled = False
@@ -165,6 +167,24 @@ class DEVO:
 
         # if self.cfg.MIXED_PRECISION:
         #     self.network.half()
+
+    def configure_update_aggregation(self):
+        if not getattr(self.cfg, "SCALAR_SOFTAGG", False):
+            return
+
+        self.network.update.agg_kk = self.scalarize_softagg(self.network.update.agg_kk)
+        self.network.update.agg_ij = self.scalarize_softagg(self.network.update.agg_ij)
+
+    def scalarize_softagg(self, agg):
+        scalar = SoftAggBasic(agg.dim, expand=agg.expand).to(next(agg.parameters()).device)
+        scalar.f.load_state_dict(agg.f.state_dict())
+        scalar.h.load_state_dict(agg.h.state_dict())
+
+        with torch.no_grad():
+            scalar.g.weight.copy_(agg.g.weight.mean(dim=0, keepdim=True))
+            scalar.g.bias.copy_(agg.g.bias.mean().view(1))
+
+        return scalar
 
     def run_update_net(self, net, ctx, corr, flow, ii, jj, kk):
         try:
