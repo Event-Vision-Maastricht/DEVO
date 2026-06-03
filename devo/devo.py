@@ -148,9 +148,34 @@ class DEVO:
         self.network.cuda()
         self.network.eval()
         self.network.requires_grad_(False)
+        self.update_op = self.network.update
+        self.update_op_compiled = False
+
+        if getattr(self.cfg, "COMPILE_UPDATE_NET", False) and hasattr(torch, "compile"):
+            try:
+                if hasattr(torch, "_dynamo"):
+                    torch._dynamo.config.suppress_errors = True
+                self.update_op = torch.compile(
+                    self.network.update,
+                    mode=getattr(self.cfg, "COMPILE_UPDATE_MODE", "reduce-overhead"),
+                    dynamic=getattr(self.cfg, "COMPILE_UPDATE_DYNAMIC", True))
+                self.update_op_compiled = True
+            except Exception as e:
+                print(f"Warning: update_net compile disabled ({e})")
 
         # if self.cfg.MIXED_PRECISION:
         #     self.network.half()
+
+    def run_update_net(self, net, ctx, corr, flow, ii, jj, kk):
+        try:
+            return self.update_op(net, ctx, corr, flow, ii, jj, kk)
+        except Exception as e:
+            if self.update_op_compiled and getattr(self.cfg, "COMPILE_UPDATE_FALLBACK", True):
+                print(f"Warning: compiled update_net failed; falling back ({e})")
+                self.update_op = self.network.update
+                self.update_op_compiled = False
+                return self.update_op(net, ctx, corr, flow, ii, jj, kk)
+            raise
 
 
     def start_viewer(self):
@@ -687,7 +712,7 @@ class DEVO:
                 corr = self.corr(coords, indicies=(kk, jj))
                 ctx = self.imap[:,kk % (self.M * self.mem)]
                 net, (delta, weight, _) = \
-                    self.network.update(net, ctx, corr, None, ii, jj, kk)
+                    self.run_update_net(net, ctx, corr, None, ii, jj, kk)
 
         return torch.quantile(delta.norm(dim=-1).float(), 0.5)
 
@@ -775,7 +800,7 @@ class DEVO:
                         ctx = self.imap[:,kk % (self.M * self.mem)]
                         with Timer("other", enabled=self.enable_timing):
                             net, (delta, weight, _) = \
-                                self.network.update(self.net[:,neural], ctx, corr, None, ii, jj, kk)
+                                self.run_update_net(self.net[:,neural], ctx, corr, None, ii, jj, kk)
 
                 self.net[:,neural] = net
                 weight = weight.float()
