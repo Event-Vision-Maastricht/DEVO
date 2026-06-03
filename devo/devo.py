@@ -200,6 +200,7 @@ class DEVO:
     def terminate(self):
         """ interpolate missing poses """
         print("keyframes", self.n)
+        self.final_refine()
         self.traj = {}
         for i in range(self.n):
             self.traj[self.tstamps_[i].item()] = self.poses_[i]
@@ -220,6 +221,29 @@ class DEVO:
             self.viewer.join()
 
         return poses, tstamps
+
+    def final_refine(self):
+        if not self.is_initialized or not getattr(self.cfg, "FINAL_BA_ENABLED", False):
+            return
+
+        ba_ii, ba_jj, ba_kk, ba_target, ba_weight = self.ba_factors()
+        if len(ba_ii) == 0:
+            return
+
+        lmbda = torch.as_tensor([1e-4], device="cuda")
+        window = getattr(self.cfg, "FINAL_BA_WINDOW", 0)
+        t0 = 1 if window <= 0 else max(self.n - window, 1)
+        rounds = max(getattr(self.cfg, "FINAL_BA_ROUNDS", 1), 1)
+        iterations = max(getattr(self.cfg, "FINAL_BA_ITERATIONS", 6), 1)
+
+        for _ in range(rounds):
+            try:
+                fastba.BA(self.poses, self.patches, self.intrinsics,
+                    ba_target, ba_weight, lmbda, ba_ii, ba_jj, ba_kk, t0, self.n,
+                    iterations)
+            except:
+                print("Warning final BA failed...")
+                return
     
     def corr(self, coords, indicies=None):
         """ local correlation volume """
