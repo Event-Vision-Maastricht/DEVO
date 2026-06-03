@@ -289,6 +289,7 @@ class DEVO:
         self.marg_target = torch.cat([self.marg_target, target[:,m].detach().float()], dim=1)
         self.marg_weight = torch.cat([self.marg_weight, weight[:,m].detach().float()], dim=1)
         self.remove_factors(m)
+        self.prune_marginalized_factors()
 
     def select_marginalized_factors(self, confidence, delta_norm, enforce_budget=False):
         if not self.marginalization_enabled() or len(self.ii) == 0:
@@ -300,6 +301,7 @@ class DEVO:
         core_window = getattr(self.cfg, "MARGINALIZE_CORE_WINDOW", 4)
         max_active_edges = getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", 0)
         force_budget = getattr(self.cfg, "MARGINALIZE_FORCE_BUDGET", False)
+        force_delta_thresh = getattr(self.cfg, "MARGINALIZE_FORCE_DELTA_THRESH", 1.0)
 
         patch_frame = self.ix[self.kk]
         newest_core = max(self.n - core_window, 0)
@@ -314,7 +316,7 @@ class DEVO:
 
         num_to_freeze = len(self.ii) - max_active_edges
         if force_budget:
-            freeze_pool = candidates
+            freeze_pool = candidates & (delta_norm <= force_delta_thresh)
         else:
             freeze_pool = converged
 
@@ -347,10 +349,32 @@ class DEVO:
         coords = self.reproject(indicies=(self.marg_ii, self.marg_jj, self.marg_kk))
         current = coords[...,self.P//2,self.P//2]
         residual = (self.marg_target - current).norm(dim=-1)[0]
+        soft_residual = getattr(self.cfg, "MARGINALIZE_SOFT_FROZEN_RESIDUAL", 2.0)
         max_residual = getattr(self.cfg, "MARGINALIZE_MAX_FROZEN_RESIDUAL", 8.0)
+        min_scale = getattr(self.cfg, "MARGINALIZE_MIN_FROZEN_WEIGHT_SCALE", 0.2)
+
+        if max_residual > soft_residual:
+            scale = 1.0 - (residual - soft_residual) / (max_residual - soft_residual)
+            scale = scale.clamp(min=min_scale, max=1.0)
+            scale = torch.where(torch.isfinite(scale), scale, torch.zeros_like(scale))
+            self.marg_weight *= scale.view(1, -1, 1)
+
         stale = (~torch.isfinite(residual)) | (residual > max_residual)
         if stale.any():
             self.remove_marginalized_factors(stale)
+
+        self.prune_marginalized_factors()
+
+    def prune_marginalized_factors(self):
+        max_frozen_edges = getattr(self.cfg, "MARGINALIZE_MAX_FROZEN_EDGES", 0)
+        if max_frozen_edges <= 0 or len(self.marg_ii) <= max_frozen_edges:
+            return
+
+        score = self.marg_weight[0].mean(dim=-1)
+        _, keep_idx = torch.topk(score, k=max_frozen_edges)
+        keep = torch.zeros(len(self.marg_ii), dtype=torch.bool, device="cuda")
+        keep[keep_idx] = True
+        self.remove_marginalized_factors(~keep)
 
     def print_marginalization_stats(self):
         if getattr(self.cfg, "MARGINALIZE_PRINT_STATS", False):
