@@ -339,14 +339,21 @@ class DEVO:
         core = (self.ii >= newest_core) | (self.jj >= newest_core)
         fresh = torch.isinf(self.active_delta_norm) | (self.active_weight[0].mean(dim=-1) <= 0)
 
-        priority = getattr(self.cfg, "WARM_DELTA_WEIGHT", 2.0) * self.active_delta_norm
-        priority = priority + getattr(self.cfg, "WARM_LOWCONF_WEIGHT", 1.0) * (1.0 - self.active_confidence)
-        priority = priority + getattr(self.cfg, "WARM_CORE_BONUS", 2.0) * core.float()
-        priority = priority.masked_fill(fresh, torch.inf)
+        stable_conf = getattr(self.cfg, "WARM_STABLE_CONF_THRESH", 0.6)
+        stable_delta = getattr(self.cfg, "WARM_STABLE_DELTA_THRESH", 0.35)
+        skip_pool = (~core) & (~fresh) & \
+            (self.active_confidence >= stable_conf) & \
+            (self.active_delta_norm <= stable_delta)
 
-        _, neural_idx = torch.topk(priority, k=min(budget, len(self.ii)))
-        neural = torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
-        neural[neural_idx] = True
+        num_to_skip = min(len(self.ii) - budget, skip_pool.sum().item())
+        neural = torch.ones(len(self.ii), dtype=torch.bool, device="cuda")
+        if num_to_skip <= 0:
+            return neural
+
+        stability = self.active_confidence - getattr(self.cfg, "WARM_DELTA_WEIGHT", 2.0) * self.active_delta_norm
+        stability = stability.masked_fill(~skip_pool, -torch.inf)
+        _, skip_idx = torch.topk(stability, k=num_to_skip)
+        neural[skip_idx] = False
         return neural
 
     def select_marginalized_factors(self, confidence, delta_norm, enforce_budget=False):
@@ -619,21 +626,37 @@ class DEVO:
             torch.arange(0, self.m, device="cuda"),
             torch.arange(0, self.n, device="cuda"), indexing='ij')
 
+    def __thin_edges(self, ii, jj):
+        if not getattr(self.cfg, "EDGE_THINNING", False) or len(ii) == 0:
+            return ii, jj
+
+        stride = max(getattr(self.cfg, "EDGE_THIN_STRIDE", 1), 1)
+        if stride <= 1:
+            return ii, jj
+
+        dense_window = getattr(self.cfg, "EDGE_THIN_DENSE_WINDOW", 3)
+        patch_frame = self.ix[ii]
+        recent = (patch_frame - jj).abs() <= dense_window
+        keep = recent | ((ii % stride) == 0)
+        return ii[keep], jj[keep]
+
     def __edges_forw(self):
         r=self.cfg.PATCH_LIFETIME  # default: 13
         t0 = self.M * max((self.n - r), 0)
         t1 = self.M * max((self.n - 1), 0)
-        return flatmeshgrid(
+        ii, jj = flatmeshgrid(
             torch.arange(t0, t1, device="cuda"),
             torch.arange(self.n-1, self.n, device="cuda"), indexing='ij')
+        return self.__thin_edges(ii, jj)
 
     def __edges_back(self):
         r=self.cfg.PATCH_LIFETIME  # default: 13
         t0 = self.M * max((self.n - 1), 0)
         t1 = self.M * max((self.n - 0), 0)
-        return flatmeshgrid(
+        ii, jj = flatmeshgrid(
             torch.arange(t0, t1, device="cuda"),
             torch.arange(max(self.n-r, 0), self.n, device="cuda"), indexing='ij')
+        return self.__thin_edges(ii, jj)
 
     def __call__(self, tstamp, image, intrinsics, scale=1.0):
         """ track new frame """
