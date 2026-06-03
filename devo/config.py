@@ -23,7 +23,7 @@ _C.PATCH_LIFETIME = 12
 
 # Active-to-frozen edge marginalization. Frozen edges skip corr/update and keep
 # contributing their last target and confidence directly to BA.
-_C.ACTIVE_EDGE_MARGINALIZATION = True
+_C.ACTIVE_EDGE_MARGINALIZATION = False
 _C.MARGINALIZE_WEIGHT_THRESH = 0.75
 _C.MARGINALIZE_DELTA_THRESH = 0.25
 _C.MARGINALIZE_MIN_AGE = 3

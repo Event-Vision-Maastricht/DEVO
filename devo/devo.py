@@ -327,7 +327,7 @@ class DEVO:
         kk = torch.cat([self.kk[k], self.marg_kk[mk]])
 
         if len(ii) == 0:
-            return 0.0
+            return float("inf")
 
         flow = pops.flow_mag(SE3(self.poses), self.patches, self.intrinsics, ii, jj, kk, beta=0.5)
         return flow.mean().item()
