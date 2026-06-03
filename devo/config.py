@@ -10,7 +10,7 @@ _C.GRADIENT_BIAS = False
 # Select between random, gradient, scorer
 _C.PATCH_SELECTOR = "scorer"
 # Eval mode of patch selector (random, topk, multinomial)
-_C.SCORER_EVAL_MODE = "multi"
+_C.SCORER_EVAL_MODE = "topk"
 _C.SCORER_EVAL_USE_GRID = True
 # Normalizer (only evs): norm, standard
 _C.NORM = "std"
@@ -28,9 +28,9 @@ _C.CORR_SINGLE_LEVEL = False
 # Active-to-frozen edge marginalization. Frozen edges skip corr/update and keep
 # contributing their last target and confidence directly to BA.
 _C.ACTIVE_EDGE_MARGINALIZATION = True
-_C.MARGINALIZE_WEIGHT_THRESH = 0.55
-_C.MARGINALIZE_DELTA_THRESH = 0.45
-_C.MARGINALIZE_MIN_AGE = 2
+_C.MARGINALIZE_WEIGHT_THRESH = 0.6
+_C.MARGINALIZE_DELTA_THRESH = 0.35
+_C.MARGINALIZE_MIN_AGE = 3
 _C.MARGINALIZE_CORE_WINDOW = 3
 _C.MARGINALIZE_WEIGHT_DECAY = 0.99
 _C.MARGINALIZE_MAX_ACTIVE_EDGES = 3000
