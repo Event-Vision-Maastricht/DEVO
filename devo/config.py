@@ -21,6 +21,14 @@ _C.REMOVAL_WINDOW = 20
 _C.OPTIMIZATION_WINDOW = 12
 _C.PATCH_LIFETIME = 12
 
+# Active-to-frozen edge marginalization. Frozen edges skip corr/update and keep
+# contributing their last target and confidence directly to BA.
+_C.ACTIVE_EDGE_MARGINALIZATION = True
+_C.MARGINALIZE_WEIGHT_THRESH = 0.75
+_C.MARGINALIZE_DELTA_THRESH = 0.25
+_C.MARGINALIZE_MIN_AGE = 3
+_C.MARGINALIZE_CORE_WINDOW = 4
+
 # threshold for keyframe removal
 _C.KEYFRAME_INDEX = 4
 _C.KEYFRAME_THRESH = 12.5

@@ -89,6 +89,11 @@ class DEVO:
         self.ii = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.jj = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.kk = torch.as_tensor([], dtype=torch.long, device="cuda")
+        self.marg_ii = torch.as_tensor([], dtype=torch.long, device="cuda")
+        self.marg_jj = torch.as_tensor([], dtype=torch.long, device="cuda")
+        self.marg_kk = torch.as_tensor([], dtype=torch.long, device="cuda")
+        self.marg_target = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
+        self.marg_weight = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
         
         # initialize poses to identity matrix
         self.poses_[:,6] = 1.0
@@ -238,6 +243,65 @@ class DEVO:
         self.kk = self.kk[~m]
         self.net = self.net[:,~m]
 
+    def remove_marginalized_factors(self, m):
+        self.marg_ii = self.marg_ii[~m]
+        self.marg_jj = self.marg_jj[~m]
+        self.marg_kk = self.marg_kk[~m]
+        self.marg_target = self.marg_target[:,~m]
+        self.marg_weight = self.marg_weight[:,~m]
+
+    def remove_all_factors(self, m_active, m_marg=None):
+        self.remove_factors(m_active)
+        if m_marg is not None:
+            self.remove_marginalized_factors(m_marg)
+
+    def marginalization_enabled(self):
+        return getattr(self.cfg, "ACTIVE_EDGE_MARGINALIZATION", False)
+
+    def marginalize_factors(self, m, target, weight):
+        if m.sum().item() == 0:
+            return
+
+        self.marg_ii = torch.cat([self.marg_ii, self.ii[m]])
+        self.marg_jj = torch.cat([self.marg_jj, self.jj[m]])
+        self.marg_kk = torch.cat([self.marg_kk, self.kk[m]])
+        self.marg_target = torch.cat([self.marg_target, target[:,m].detach().float()], dim=1)
+        self.marg_weight = torch.cat([self.marg_weight, weight[:,m].detach().float()], dim=1)
+        self.remove_factors(m)
+
+    def select_marginalized_factors(self, delta, weight):
+        if not self.marginalization_enabled() or len(self.ii) == 0:
+            return torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
+
+        weight_thresh = getattr(self.cfg, "MARGINALIZE_WEIGHT_THRESH", 0.75)
+        delta_thresh = getattr(self.cfg, "MARGINALIZE_DELTA_THRESH", 0.25)
+        min_age = getattr(self.cfg, "MARGINALIZE_MIN_AGE", 3)
+        core_window = getattr(self.cfg, "MARGINALIZE_CORE_WINDOW", 4)
+
+        confidence = weight[0].mean(dim=-1)
+        delta_norm = delta[0].float().norm(dim=-1)
+        patch_frame = self.ix[self.kk]
+        newest_core = max(self.n - core_window, 0)
+
+        old_enough = patch_frame <= self.n - min_age
+        outside_core = (self.ii < newest_core) & (self.jj < newest_core)
+        return (confidence >= weight_thresh) & (delta_norm <= delta_thresh) & old_enough & outside_core
+
+    def ba_factors(self, target=None, weight=None):
+        if target is None or len(self.ii) == 0:
+            ii, jj, kk = self.marg_ii, self.marg_jj, self.marg_kk
+            return ii, jj, kk, self.marg_target, self.marg_weight
+
+        if len(self.marg_ii) == 0:
+            return self.ii, self.jj, self.kk, target.float(), weight.float()
+
+        ii = torch.cat([self.ii, self.marg_ii])
+        jj = torch.cat([self.jj, self.marg_jj])
+        kk = torch.cat([self.kk, self.marg_kk])
+        target = torch.cat([target.float(), self.marg_target], dim=1)
+        weight = torch.cat([weight.float(), self.marg_weight], dim=1)
+        return ii, jj, kk, target, weight
+
     def motion_probe(self):
         """ kinda hacky way to ensure enough motion for initialization """
         kk = torch.arange(self.m-self.M, self.m, device="cuda")
@@ -257,9 +321,13 @@ class DEVO:
 
     def motionmag(self, i, j):
         k = (self.ii == i) & (self.jj == j)
-        ii = self.ii[k]
-        jj = self.jj[k]
-        kk = self.kk[k]
+        mk = (self.marg_ii == i) & (self.marg_jj == j)
+        ii = torch.cat([self.ii[k], self.marg_ii[mk]])
+        jj = torch.cat([self.jj[k], self.marg_jj[mk]])
+        kk = torch.cat([self.kk[k], self.marg_kk[mk]])
+
+        if len(ii) == 0:
+            return 0.0
 
         flow = pops.flow_mag(SE3(self.poses), self.patches, self.intrinsics, ii, jj, kk, beta=0.5)
         return flow.mean().item()
@@ -280,11 +348,15 @@ class DEVO:
             self.delta[t1] = (t0, dP) # store relative pose between <t-5, t-4>
 
             to_remove = (self.ii == k) | (self.jj == k)
-            self.remove_factors(to_remove)
+            marg_to_remove = (self.marg_ii == k) | (self.marg_jj == k)
+            self.remove_all_factors(to_remove, marg_to_remove)
 
             self.kk[self.ii > k] -= self.M
             self.ii[self.ii > k] -= 1
             self.jj[self.jj > k] -= 1
+            self.marg_kk[self.marg_ii > k] -= self.M
+            self.marg_ii[self.marg_ii > k] -= 1
+            self.marg_jj[self.marg_jj > k] -= 1
 
             for i in range(k, self.n-1):
                 self.tstamps_[i] = self.tstamps_[i+1]
@@ -303,21 +375,33 @@ class DEVO:
             self.m -= self.M
 
         to_remove = self.ix[self.kk] < self.n - self.cfg.REMOVAL_WINDOW
-        self.remove_factors(to_remove)
+        marg_to_remove = self.ix[self.marg_kk] < self.n - self.cfg.REMOVAL_WINDOW
+        self.remove_all_factors(to_remove, marg_to_remove)
 
     def update(self):
-        coords = self.reproject()
+        if len(self.ii) > 0:
+            coords = self.reproject()
 
-        with autocast(enabled=True):
-            
-            corr = self.corr(coords)
-            ctx = self.imap[:,self.kk % (self.M * self.mem)]
-            with Timer("other", enabled=self.enable_timing):
-                self.net, (delta, weight, _) = \
-                    self.network.update(self.net, ctx, corr, None, self.ii, self.jj, self.kk)
+            with autocast(enabled=True):
+
+                corr = self.corr(coords)
+                ctx = self.imap[:,self.kk % (self.M * self.mem)]
+                with Timer("other", enabled=self.enable_timing):
+                    self.net, (delta, weight, _) = \
+                        self.network.update(self.net, ctx, corr, None, self.ii, self.jj, self.kk)
+
+            weight = weight.float()
+            target = coords[...,self.P//2,self.P//2] + delta.float()
+            to_marginalize = self.select_marginalized_factors(delta, weight)
+            if to_marginalize.any():
+                self.marginalize_factors(to_marginalize, target, weight)
+                target = target[:,~to_marginalize]
+                weight = weight[:,~to_marginalize]
+        else:
+            target = None
+            weight = None
 
         lmbda = torch.as_tensor([1e-4], device="cuda")
-        weight = weight.float()
             
             # [DEBUG]
             # dij = (self.ii - self.jj).abs()
@@ -327,17 +411,18 @@ class DEVO:
             # print("BA weights max", weight[0, k].max().item())
             # print("BA weights min", weight[0, k].min().item())
             # [DEBUG]
-        target = coords[...,self.P//2,self.P//2] + delta.float()
+        ba_ii, ba_jj, ba_kk, ba_target, ba_weight = self.ba_factors(target, weight)
 
         with Timer("BA", enabled=self.enable_timing):
             t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
             t0 = max(t0, 1)
 
-            try:
-                fastba.BA(self.poses, self.patches, self.intrinsics, 
-                    target, weight, lmbda, self.ii, self.jj, self.kk, t0, self.n, 2)
-            except:
-                print("Warning BA failed...")
+            if len(ba_ii) > 0:
+                try:
+                    fastba.BA(self.poses, self.patches, self.intrinsics,
+                        ba_target, ba_weight, lmbda, ba_ii, ba_jj, ba_kk, t0, self.n, 2)
+                except:
+                    print("Warning BA failed...")
             
             points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
             points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
