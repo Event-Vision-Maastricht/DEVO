@@ -96,7 +96,6 @@ class DEVO:
         self.active_confidence = torch.as_tensor([], dtype=torch.float, device="cuda")
         self.active_delta_norm = torch.as_tensor([], dtype=torch.float, device="cuda")
         self.active_keepalive = torch.as_tensor([], dtype=torch.long, device="cuda")
-        self.active_refresh_age = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_ii = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_jj = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_kk = torch.as_tensor([], dtype=torch.long, device="cuda")
@@ -384,17 +383,70 @@ class DEVO:
                 print("Warning final BA failed...")
                 return
     
-    def corr(self, coords, indicies=None):
+    def corr(self, coords, indicies=None, fine_mask=None):
         """ local correlation volume """
         ii, jj = indicies if indicies is not None else (self.kk, self.jj)
         ii1 = ii % (self.M * self.mem)
         jj1 = jj % (self.mem)
-        corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3)
+
+        if fine_mask is None:
+            corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3)
+        else:
+            fine_mask = fine_mask.bool()
+            corr2_probe = altcorr.corr(self.gmap, self.pyramid[1], coords / 4, ii1, jj1, 3)
+            corr1 = torch.zeros_like(corr2_probe)
+            if fine_mask.any():
+                corr1[:,fine_mask] = altcorr.corr(
+                    self.gmap, self.pyramid[0], coords[:,fine_mask] / 1,
+                    ii1[fine_mask], jj1[fine_mask], 3)
+            corr2 = corr2_probe
+
         if getattr(self.cfg, "CORR_SINGLE_LEVEL", False):
             corr2 = torch.zeros_like(corr1)
+        elif fine_mask is not None:
+            pass
         else:
             corr2 = altcorr.corr(self.gmap, self.pyramid[1], coords / 4, ii1, jj1, 3)
         return torch.stack([corr1, corr2], -1).view(1, len(ii), -1)
+
+    def fine_correlation_mask(self, ii, jj, active_mask=None):
+        if not getattr(self.cfg, "SELECTIVE_FINE_CORR", False) or len(ii) == 0:
+            return None
+
+        if active_mask is None:
+            confidence = self.active_confidence
+            delta_norm = self.active_delta_norm
+            active_weight = self.active_weight
+        else:
+            confidence = self.active_confidence[active_mask]
+            delta_norm = self.active_delta_norm[active_mask]
+            active_weight = self.active_weight[:,active_mask]
+
+        if len(confidence) != len(ii):
+            return None
+
+        core_window = getattr(self.cfg, "SELECTIVE_FINE_CORE_WINDOW", 3)
+        newest_core = max(self.n - core_window, 0)
+        core = (ii >= newest_core) | (jj >= newest_core)
+        fresh = torch.isinf(delta_norm) | (active_weight[0].mean(dim=-1) <= 0)
+
+        conf_thresh = getattr(self.cfg, "SELECTIVE_FINE_CONF_THRESH", 0.6)
+        delta_thresh = getattr(self.cfg, "SELECTIVE_FINE_DELTA_THRESH", 0.35)
+        uncertain = (confidence < conf_thresh) | (delta_norm > delta_thresh)
+        fine = core | fresh | uncertain | (~torch.isfinite(delta_norm))
+
+        min_ratio = getattr(self.cfg, "SELECTIVE_FINE_MIN_RATIO", 0.7)
+        min_edges = min(len(ii), int(np.ceil(min_ratio * len(ii))))
+        if fine.sum().item() >= min_edges:
+            return fine
+
+        num_to_add = min_edges - fine.sum().item()
+        score = delta_norm.float() - confidence.float()
+        score = torch.where(torch.isfinite(score), score, torch.zeros_like(score))
+        score = score.masked_fill(fine, -torch.inf)
+        _, add_idx = torch.topk(score, k=num_to_add)
+        fine[add_idx] = True
+        return fine
 
     def reproject(self, indicies=None):
         """ reproject patch k from i -> j """
@@ -430,9 +482,6 @@ class DEVO:
         self.active_keepalive = torch.cat([
             self.active_keepalive,
             torch.zeros(len(ii), dtype=torch.long, device="cuda")])
-        self.active_refresh_age = torch.cat([
-            self.active_refresh_age,
-            torch.zeros(len(ii), dtype=torch.long, device="cuda")])
 
     def remove_factors(self, m):
         self.ii = self.ii[~m]
@@ -445,7 +494,6 @@ class DEVO:
         self.active_confidence = self.active_confidence[~m]
         self.active_delta_norm = self.active_delta_norm[~m]
         self.active_keepalive = self.active_keepalive[~m]
-        self.active_refresh_age = self.active_refresh_age[~m]
         if m.any():
             self.bump_graph_version()
 
@@ -513,9 +561,6 @@ class DEVO:
         self.active_keepalive = torch.cat([
             self.active_keepalive,
             torch.full((num,), keepalive, dtype=torch.long, device="cuda")])
-        self.active_refresh_age = torch.cat([
-            self.active_refresh_age,
-            torch.zeros(num, dtype=torch.long, device="cuda")])
         self.remove_marginalized_factors(m)
 
     def current_active_budget(self):
@@ -585,12 +630,9 @@ class DEVO:
         newest_core = max(self.n - core_window, 0)
         core = (self.ii >= newest_core) | (self.jj >= newest_core)
         fresh = torch.isinf(self.active_delta_norm) | (self.active_weight[0].mean(dim=-1) <= 0)
-        max_skip = getattr(self.cfg, "WARM_MAX_SKIP_FRAMES", 2)
-        stale = self.active_refresh_age >= max_skip
-
         stable_conf = getattr(self.cfg, "WARM_STABLE_CONF_THRESH", 0.6)
         stable_delta = getattr(self.cfg, "WARM_STABLE_DELTA_THRESH", 0.35)
-        skip_pool = (~core) & (~fresh) & (~stale) & \
+        skip_pool = (~core) & (~fresh) & \
             (self.active_confidence >= stable_conf) & \
             (self.active_delta_norm <= stable_delta)
 
@@ -924,7 +966,9 @@ class DEVO:
 
                     with autocast(enabled=True):
 
-                        corr = self.corr(coords, indicies=(kk, jj))
+                        active_mask = None if all_neural else neural
+                        fine_mask = self.fine_correlation_mask(ii, jj, active_mask)
+                        corr = self.corr(coords, indicies=(kk, jj), fine_mask=fine_mask)
                         ctx = self.imap[:,kk % (self.M * self.mem)]
                         topology = self.update_topology(ii, jj, kk, cacheable=all_neural)
                         with Timer("other", enabled=self.enable_timing):
@@ -946,15 +990,12 @@ class DEVO:
                     self.active_delta = delta.detach().float()
                     self.active_confidence = confidence.detach().float()
                     self.active_delta_norm = delta_norm.detach().float()
-                    self.active_refresh_age.zero_()
                 else:
-                    self.active_refresh_age += 1
                     self.active_target[:,neural] = target.detach().float()
                     self.active_weight[:,neural] = weight.detach().float()
                     self.active_delta[:,neural] = delta.detach().float()
                     self.active_confidence[neural] = confidence.detach().float()
                     self.active_delta_norm[neural] = delta_norm.detach().float()
-                    self.active_refresh_age[neural] = 0
                 self.update_active_budget(confidence, delta_norm)
 
             to_marginalize = self.select_marginalized_factors(
