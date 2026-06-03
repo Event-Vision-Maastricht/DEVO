@@ -460,20 +460,40 @@ class DEVO:
         if self.marginalize_update_count % interval != 0:
             return
 
+        finite_delta = torch.where(torch.isfinite(delta_norm), delta_norm, torch.zeros_like(delta_norm))
         delta_thresh = getattr(self.cfg, "MARGINALIZE_ADAPT_DELTA_THRESH", 0.75)
         conf_thresh = getattr(self.cfg, "MARGINALIZE_ADAPT_CONF_THRESH", 0.45)
-        difficult = (delta_norm > delta_thresh) | (confidence < conf_thresh)
-        hard_ratio = difficult.float().mean().item()
+        motion_thresh = getattr(self.cfg, "MARGINALIZE_ADAPT_MOTION_THRESH", 0.45)
+        hard_motion_thresh = getattr(self.cfg, "MARGINALIZE_ADAPT_HARD_MOTION_THRESH", 0.8)
 
-        if hard_ratio >= getattr(self.cfg, "MARGINALIZE_ADAPT_HARD_RATIO", 0.25):
-            self.active_edge_budget = getattr(self.cfg, "MARGINALIZE_HARD_ACTIVE_EDGES", 3200)
-            self.neural_edge_budget = getattr(self.cfg, "WARM_HARD_NEURAL_EDGES", 2600)
-        elif hard_ratio >= getattr(self.cfg, "MARGINALIZE_ADAPT_MEDIUM_RATIO", 0.12):
-            self.active_edge_budget = getattr(self.cfg, "MARGINALIZE_BASE_ACTIVE_EDGES", 2400)
-            self.neural_edge_budget = getattr(self.cfg, "WARM_BASE_NEURAL_EDGES", 2100)
+        difficult = (finite_delta > delta_thresh) | (confidence < conf_thresh)
+        hard_ratio = difficult.float().mean().item()
+        motion = finite_delta.mean().item()
+
+        hard = hard_ratio >= getattr(self.cfg, "MARGINALIZE_ADAPT_HARD_RATIO", 0.25) or \
+            motion >= hard_motion_thresh
+        medium = hard_ratio >= getattr(self.cfg, "MARGINALIZE_ADAPT_MEDIUM_RATIO", 0.12) or \
+            motion >= motion_thresh
+
+        if hard:
+            target_active = getattr(self.cfg, "MARGINALIZE_HARD_ACTIVE_EDGES", 3800)
+            target_neural = getattr(self.cfg, "WARM_HARD_NEURAL_EDGES", 2600)
+        elif medium:
+            target_active = getattr(self.cfg, "MARGINALIZE_BASE_ACTIVE_EDGES", 3200)
+            target_neural = getattr(self.cfg, "WARM_BASE_NEURAL_EDGES", 2100)
         else:
-            self.active_edge_budget = getattr(self.cfg, "MARGINALIZE_MIN_ACTIVE_EDGES", 2000)
-            self.neural_edge_budget = getattr(self.cfg, "WARM_MIN_NEURAL_EDGES", 1800)
+            target_active = getattr(self.cfg, "MARGINALIZE_MIN_ACTIVE_EDGES", 3000)
+            target_neural = getattr(self.cfg, "WARM_MIN_NEURAL_EDGES", 1800)
+
+        max_step = getattr(self.cfg, "MARGINALIZE_ADAPT_MAX_STEP", 400)
+        if self.active_edge_budget <= 0 or max_step <= 0:
+            self.active_edge_budget = target_active
+        elif target_active > self.active_edge_budget:
+            self.active_edge_budget = min(target_active, self.active_edge_budget + max_step)
+        else:
+            self.active_edge_budget = max(target_active, self.active_edge_budget - max_step)
+
+        self.neural_edge_budget = target_neural
 
     def select_neural_factors(self):
         if not getattr(self.cfg, "WARM_UPDATE_ENABLED", False) or len(self.ii) == 0:
