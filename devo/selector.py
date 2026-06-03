@@ -59,6 +59,8 @@ class PatchSelector():
         self.NMS_RADIUS = 1.5
         self.NMS_IOU = 0.4
         self.NMS_CANDIDATE_FACTOR = 4
+        self.COVERAGE_CANDIDATE_FACTOR = 6
+        self.COVERAGE_RADIUS = 5.0
         
     def _grid(self, scores):
         b, n, h1, w1 = scores.shape
@@ -239,6 +241,59 @@ class PatchSelector():
                 unique = torch.cat([unique, repeats])
             rows.append(unique[:patches_per_image])
         return torch.stack(rows, dim=0)
+
+    def _coverage_topk(self, scores, patches_per_image):
+        """greedy score/coverage patch selection.
+
+        The scorer proposes a larger candidate set. We then greedily retain
+        candidates that maximize score while penalizing proximity to already
+        selected patches. This is an approximate ANMS-style selector: it keeps
+        high-response event structure but improves spatial conditioning.
+        """
+        b, n, h, w = scores.shape
+        bn = b * n
+        flat = scores.view(bn, -1)
+        candidates = min(
+            max(patches_per_image * self.COVERAGE_CANDIDATE_FACTOR, patches_per_image),
+            flat.shape[-1])
+        cand_score, cand_idx = torch.topk(flat, candidates, dim=-1)
+
+        x = cand_idx % w
+        y = torch.div(cand_idx, w, rounding_mode='floor')
+        coords = torch.stack([x.float(), y.float()], dim=-1)
+
+        selected_rows = []
+        radius2 = self.COVERAGE_RADIUS * self.COVERAGE_RADIUS
+        score_scale = cand_score.max(dim=-1, keepdim=True).values.clamp(min=EPSILON)
+        base_score = cand_score / score_scale
+
+        for row in range(bn):
+            picked = []
+            available = torch.ones(candidates, dtype=torch.bool, device=scores.device)
+            min_dist2 = torch.full((candidates,), float("inf"), device=scores.device)
+
+            for _ in range(patches_per_image):
+                if picked:
+                    last = coords[row, picked[-1]]
+                    dist2 = ((coords[row] - last) ** 2).sum(dim=-1)
+                    min_dist2 = torch.minimum(min_dist2, dist2)
+                    coverage = (min_dist2 / radius2).clamp(max=1.0)
+                else:
+                    coverage = torch.ones(candidates, device=scores.device)
+
+                utility = base_score[row] * (0.35 + 0.65 * coverage)
+                utility = utility.masked_fill(~available, -torch.inf)
+                nxt = torch.argmax(utility)
+                picked.append(nxt)
+                available[nxt] = False
+
+            picked = torch.stack(picked)
+            selected_rows.append(cand_idx[row, picked])
+
+        idx = torch.stack(selected_rows, dim=0)
+        x = idx % w
+        y = torch.div(idx, w, rounding_mode='floor')
+        return (x, y)
     
     def _nms(self, scores, patches_per_image):
         """ pooled nms sampling

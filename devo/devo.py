@@ -383,70 +383,17 @@ class DEVO:
                 print("Warning final BA failed...")
                 return
     
-    def corr(self, coords, indicies=None, fine_mask=None):
+    def corr(self, coords, indicies=None):
         """ local correlation volume """
         ii, jj = indicies if indicies is not None else (self.kk, self.jj)
         ii1 = ii % (self.M * self.mem)
         jj1 = jj % (self.mem)
-
-        if fine_mask is None:
-            corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3)
-        else:
-            fine_mask = fine_mask.bool()
-            corr2_probe = altcorr.corr(self.gmap, self.pyramid[1], coords / 4, ii1, jj1, 3)
-            corr1 = torch.zeros_like(corr2_probe)
-            if fine_mask.any():
-                corr1[:,fine_mask] = altcorr.corr(
-                    self.gmap, self.pyramid[0], coords[:,fine_mask] / 1,
-                    ii1[fine_mask], jj1[fine_mask], 3)
-            corr2 = corr2_probe
-
+        corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3)
         if getattr(self.cfg, "CORR_SINGLE_LEVEL", False):
             corr2 = torch.zeros_like(corr1)
-        elif fine_mask is not None:
-            pass
         else:
             corr2 = altcorr.corr(self.gmap, self.pyramid[1], coords / 4, ii1, jj1, 3)
         return torch.stack([corr1, corr2], -1).view(1, len(ii), -1)
-
-    def fine_correlation_mask(self, ii, jj, active_mask=None):
-        if not getattr(self.cfg, "SELECTIVE_FINE_CORR", False) or len(ii) == 0:
-            return None
-
-        if active_mask is None:
-            confidence = self.active_confidence
-            delta_norm = self.active_delta_norm
-            active_weight = self.active_weight
-        else:
-            confidence = self.active_confidence[active_mask]
-            delta_norm = self.active_delta_norm[active_mask]
-            active_weight = self.active_weight[:,active_mask]
-
-        if len(confidence) != len(ii):
-            return None
-
-        core_window = getattr(self.cfg, "SELECTIVE_FINE_CORE_WINDOW", 3)
-        newest_core = max(self.n - core_window, 0)
-        core = (ii >= newest_core) | (jj >= newest_core)
-        fresh = torch.isinf(delta_norm) | (active_weight[0].mean(dim=-1) <= 0)
-
-        conf_thresh = getattr(self.cfg, "SELECTIVE_FINE_CONF_THRESH", 0.6)
-        delta_thresh = getattr(self.cfg, "SELECTIVE_FINE_DELTA_THRESH", 0.35)
-        uncertain = (confidence < conf_thresh) | (delta_norm > delta_thresh)
-        fine = core | fresh | uncertain | (~torch.isfinite(delta_norm))
-
-        min_ratio = getattr(self.cfg, "SELECTIVE_FINE_MIN_RATIO", 0.7)
-        min_edges = min(len(ii), int(np.ceil(min_ratio * len(ii))))
-        if fine.sum().item() >= min_edges:
-            return fine
-
-        num_to_add = min_edges - fine.sum().item()
-        score = delta_norm.float() - confidence.float()
-        score = torch.where(torch.isfinite(score), score, torch.zeros_like(score))
-        score = score.masked_fill(fine, -torch.inf)
-        _, add_idx = torch.topk(score, k=num_to_add)
-        fine[add_idx] = True
-        return fine
 
     def reproject(self, indicies=None):
         """ reproject patch k from i -> j """
@@ -966,9 +913,7 @@ class DEVO:
 
                     with autocast(enabled=True):
 
-                        active_mask = None if all_neural else neural
-                        fine_mask = self.fine_correlation_mask(ii, jj, active_mask)
-                        corr = self.corr(coords, indicies=(kk, jj), fine_mask=fine_mask)
+                        corr = self.corr(coords, indicies=(kk, jj))
                         ctx = self.imap[:,kk % (self.M * self.mem)]
                         topology = self.update_topology(ii, jj, kk, cacheable=all_neural)
                         with Timer("other", enabled=self.enable_timing):
