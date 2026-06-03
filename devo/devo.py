@@ -145,6 +145,7 @@ class DEVO:
 
         self.network.cuda()
         self.network.eval()
+        self.network.requires_grad_(False)
 
         # if self.cfg.MIXED_PRECISION:
         #     self.network.half()
@@ -616,11 +617,12 @@ class DEVO:
         net = torch.zeros(1, len(ii), self.dim_inet, **self.kwargs)
         coords = self.reproject(indicies=(ii, jj, kk))
 
-        with autocast(enabled=self.cfg.MIXED_PRECISION):
-            corr = self.corr(coords, indicies=(kk, jj))
-            ctx = self.imap[:,kk % (self.M * self.mem)]
-            net, (delta, weight, _) = \
-                self.network.update(net, ctx, corr, None, ii, jj, kk)
+        with torch.no_grad():
+            with autocast(enabled=self.cfg.MIXED_PRECISION):
+                corr = self.corr(coords, indicies=(kk, jj))
+                ctx = self.imap[:,kk % (self.M * self.mem)]
+                net, (delta, weight, _) = \
+                    self.network.update(net, ctx, corr, None, ii, jj, kk)
 
         return torch.quantile(delta.norm(dim=-1).float(), 0.5)
 
@@ -699,15 +701,16 @@ class DEVO:
                 ii = self.ii[neural]
                 jj = self.jj[neural]
                 kk = self.kk[neural]
-                coords = self.reproject(indicies=(ii, jj, kk))
+                with torch.no_grad():
+                    coords = self.reproject(indicies=(ii, jj, kk))
 
-                with autocast(enabled=True):
+                    with autocast(enabled=True):
 
-                    corr = self.corr(coords, indicies=(kk, jj))
-                    ctx = self.imap[:,kk % (self.M * self.mem)]
-                    with Timer("other", enabled=self.enable_timing):
-                        net, (delta, weight, _) = \
-                            self.network.update(self.net[:,neural], ctx, corr, None, ii, jj, kk)
+                        corr = self.corr(coords, indicies=(kk, jj))
+                        ctx = self.imap[:,kk % (self.M * self.mem)]
+                        with Timer("other", enabled=self.enable_timing):
+                            net, (delta, weight, _) = \
+                                self.network.update(self.net[:,neural], ctx, corr, None, ii, jj, kk)
 
                 self.net[:,neural] = net
                 weight = weight.float()
@@ -898,13 +901,14 @@ class DEVO:
         # plt.show()
 
         # TODO patches with depth is available (val)
-        with autocast(enabled=self.cfg.MIXED_PRECISION):
-            fmap, gmap, imap, patches, _, clr = \
-                self.network.patchify(image,
-                    patches_per_image=self.cfg.PATCHES_PER_FRAME, 
-                    return_color=True,
-                    scorer_eval_mode=self.cfg.SCORER_EVAL_MODE,
-                    scorer_eval_use_grid=self.cfg.SCORER_EVAL_USE_GRID)
+        with torch.no_grad():
+            with autocast(enabled=self.cfg.MIXED_PRECISION):
+                fmap, gmap, imap, patches, _, clr = \
+                    self.network.patchify(image,
+                        patches_per_image=self.cfg.PATCHES_PER_FRAME,
+                        return_color=True,
+                        scorer_eval_mode=self.cfg.SCORER_EVAL_MODE,
+                        scorer_eval_use_grid=self.cfg.SCORER_EVAL_USE_GRID)
 
         self.patches_gt_[self.n] = patches.clone()
 
