@@ -98,7 +98,10 @@ class DEVO:
         self.marg_kk = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_target = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
         self.marg_weight = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
+        self.marg_weight_scale = torch.zeros(1, 0, 1, dtype=torch.float, device="cuda")
         self.marginalize_update_count = 0
+        self.active_edge_budget = getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", 0)
+        self.neural_edge_budget = getattr(self.cfg, "WARM_BASE_NEURAL_EDGES", 0)
         
         # initialize poses to identity matrix
         self.poses_[:,6] = 1.0
@@ -270,6 +273,7 @@ class DEVO:
         self.marg_kk = self.marg_kk[~m]
         self.marg_target = self.marg_target[:,~m]
         self.marg_weight = self.marg_weight[:,~m]
+        self.marg_weight_scale = self.marg_weight_scale[:,~m]
 
     def remove_all_factors(self, m_active, m_marg=None):
         self.remove_factors(m_active)
@@ -288,8 +292,62 @@ class DEVO:
         self.marg_kk = torch.cat([self.marg_kk, self.kk[m]])
         self.marg_target = torch.cat([self.marg_target, target[:,m].detach().float()], dim=1)
         self.marg_weight = torch.cat([self.marg_weight, weight[:,m].detach().float()], dim=1)
+        scale = torch.ones(1, m.sum().item(), 1, dtype=torch.float, device="cuda")
+        self.marg_weight_scale = torch.cat([self.marg_weight_scale, scale], dim=1)
         self.remove_factors(m)
         self.prune_marginalized_factors()
+
+    def current_active_budget(self):
+        if not getattr(self.cfg, "MARGINALIZE_ADAPTIVE_BUDGET", False):
+            return getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", 0)
+        return self.active_edge_budget
+
+    def update_active_budget(self, confidence, delta_norm):
+        if not getattr(self.cfg, "MARGINALIZE_ADAPTIVE_BUDGET", False) or len(confidence) == 0:
+            self.active_edge_budget = getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", 0)
+            return
+
+        interval = max(getattr(self.cfg, "MARGINALIZE_ADAPT_INTERVAL", 1), 1)
+        if self.marginalize_update_count % interval != 0:
+            return
+
+        delta_thresh = getattr(self.cfg, "MARGINALIZE_ADAPT_DELTA_THRESH", 0.75)
+        conf_thresh = getattr(self.cfg, "MARGINALIZE_ADAPT_CONF_THRESH", 0.45)
+        difficult = (delta_norm > delta_thresh) | (confidence < conf_thresh)
+        hard_ratio = difficult.float().mean().item()
+
+        if hard_ratio >= getattr(self.cfg, "MARGINALIZE_ADAPT_HARD_RATIO", 0.25):
+            self.active_edge_budget = getattr(self.cfg, "MARGINALIZE_HARD_ACTIVE_EDGES", 3200)
+            self.neural_edge_budget = getattr(self.cfg, "WARM_HARD_NEURAL_EDGES", 2600)
+        elif hard_ratio >= getattr(self.cfg, "MARGINALIZE_ADAPT_MEDIUM_RATIO", 0.12):
+            self.active_edge_budget = getattr(self.cfg, "MARGINALIZE_BASE_ACTIVE_EDGES", 2400)
+            self.neural_edge_budget = getattr(self.cfg, "WARM_BASE_NEURAL_EDGES", 2100)
+        else:
+            self.active_edge_budget = getattr(self.cfg, "MARGINALIZE_MIN_ACTIVE_EDGES", 2000)
+            self.neural_edge_budget = getattr(self.cfg, "WARM_MIN_NEURAL_EDGES", 1800)
+
+    def select_neural_factors(self):
+        if not getattr(self.cfg, "WARM_UPDATE_ENABLED", False) or len(self.ii) == 0:
+            return torch.ones(len(self.ii), dtype=torch.bool, device="cuda")
+
+        budget = self.neural_edge_budget
+        if budget <= 0 or len(self.ii) <= budget:
+            return torch.ones(len(self.ii), dtype=torch.bool, device="cuda")
+
+        core_window = getattr(self.cfg, "MARGINALIZE_CORE_WINDOW", 4)
+        newest_core = max(self.n - core_window, 0)
+        core = (self.ii >= newest_core) | (self.jj >= newest_core)
+        fresh = torch.isinf(self.active_delta_norm) | (self.active_weight[0].mean(dim=-1) <= 0)
+
+        priority = getattr(self.cfg, "WARM_DELTA_WEIGHT", 2.0) * self.active_delta_norm
+        priority = priority + getattr(self.cfg, "WARM_LOWCONF_WEIGHT", 1.0) * (1.0 - self.active_confidence)
+        priority = priority + getattr(self.cfg, "WARM_CORE_BONUS", 2.0) * core.float()
+        priority = priority.masked_fill(fresh, torch.inf)
+
+        _, neural_idx = torch.topk(priority, k=min(budget, len(self.ii)))
+        neural = torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
+        neural[neural_idx] = True
+        return neural
 
     def select_marginalized_factors(self, confidence, delta_norm, enforce_budget=False):
         if not self.marginalization_enabled() or len(self.ii) == 0:
@@ -299,7 +357,7 @@ class DEVO:
         delta_thresh = getattr(self.cfg, "MARGINALIZE_DELTA_THRESH", 0.25)
         min_age = getattr(self.cfg, "MARGINALIZE_MIN_AGE", 3)
         core_window = getattr(self.cfg, "MARGINALIZE_CORE_WINDOW", 4)
-        max_active_edges = getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", 0)
+        max_active_edges = self.current_active_budget()
         force_budget = getattr(self.cfg, "MARGINALIZE_FORCE_BUDGET", False)
         force_delta_thresh = getattr(self.cfg, "MARGINALIZE_FORCE_DELTA_THRESH", 1.0)
         freeze_delta_weight = getattr(self.cfg, "MARGINALIZE_FREEZE_DELTA_WEIGHT", 1.0)
@@ -358,7 +416,7 @@ class DEVO:
             scale = 1.0 - (residual - soft_residual) / (max_residual - soft_residual)
             scale = scale.clamp(min=min_scale, max=1.0)
             scale = torch.where(torch.isfinite(scale), scale, torch.zeros_like(scale))
-            self.marg_weight *= scale.view(1, -1, 1)
+            self.marg_weight_scale = scale.view(1, -1, 1)
 
         stale = (~torch.isfinite(residual)) | (residual > max_residual)
         if stale.any():
@@ -383,12 +441,14 @@ class DEVO:
 
     def print_marginalization_stats(self):
         if getattr(self.cfg, "MARGINALIZE_PRINT_STATS", False):
-            print(f"edges active={len(self.ii)} frozen={len(self.marg_ii)}")
+            print(f"edges active={len(self.ii)} frozen={len(self.marg_ii)} active_budget={self.current_active_budget()} neural_budget={self.neural_edge_budget}")
 
     def ba_factors(self, target=None, weight=None):
-        if target is None or len(self.ii) == 0:
-            ii, jj, kk = self.marg_ii, self.marg_jj, self.marg_kk
-            return ii, jj, kk, self.marg_target, self.marg_weight
+        if target is None:
+            if len(self.ii) == 0:
+                return self.marg_ii, self.marg_jj, self.marg_kk, self.marg_target, self.marg_weight * self.marg_weight_scale
+            target = self.active_target
+            weight = self.active_weight
 
         if len(self.marg_ii) == 0:
             return self.ii, self.jj, self.kk, target.float(), weight.float()
@@ -397,7 +457,7 @@ class DEVO:
         jj = torch.cat([self.jj, self.marg_jj])
         kk = torch.cat([self.kk, self.marg_kk])
         target = torch.cat([target.float(), self.marg_target], dim=1)
-        weight = torch.cat([weight.float(), self.marg_weight], dim=1)
+        weight = torch.cat([weight.float(), self.marg_weight * self.marg_weight_scale], dim=1)
         return ii, jj, kk, target, weight
 
     def motion_probe(self):
@@ -482,35 +542,37 @@ class DEVO:
         self.print_marginalization_stats()
 
         if len(self.ii) > 0:
-            coords = self.reproject()
+            neural = self.select_neural_factors()
+            if neural.any():
+                ii = self.ii[neural]
+                jj = self.jj[neural]
+                kk = self.kk[neural]
+                coords = self.reproject(indicies=(ii, jj, kk))
 
-            with autocast(enabled=True):
+                with autocast(enabled=True):
 
-                corr = self.corr(coords)
-                ctx = self.imap[:,self.kk % (self.M * self.mem)]
-                with Timer("other", enabled=self.enable_timing):
-                    self.net, (delta, weight, _) = \
-                        self.network.update(self.net, ctx, corr, None, self.ii, self.jj, self.kk)
+                    corr = self.corr(coords, indicies=(kk, jj))
+                    ctx = self.imap[:,kk % (self.M * self.mem)]
+                    with Timer("other", enabled=self.enable_timing):
+                        net, (delta, weight, _) = \
+                            self.network.update(self.net[:,neural], ctx, corr, None, ii, jj, kk)
 
-            weight = weight.float()
-            target = coords[...,self.P//2,self.P//2] + delta.float()
-            confidence = weight[0].mean(dim=-1)
-            delta_norm = delta[0].float().norm(dim=-1)
-            to_marginalize = self.select_marginalized_factors(confidence, delta_norm)
+                self.net[:,neural] = net
+                weight = weight.float()
+                target = coords[...,self.P//2,self.P//2] + delta.float()
+                confidence = weight[0].mean(dim=-1)
+                delta_norm = delta[0].float().norm(dim=-1)
+
+                self.active_target[:,neural] = target.detach().float()
+                self.active_weight[:,neural] = weight.detach().float()
+                self.active_confidence[neural] = confidence.detach().float()
+                self.active_delta_norm[neural] = delta_norm.detach().float()
+                self.update_active_budget(confidence, delta_norm)
+
+            to_marginalize = self.select_marginalized_factors(
+                self.active_confidence, self.active_delta_norm)
             if to_marginalize.any():
-                self.marginalize_factors(to_marginalize, target, weight)
-                target = target[:,~to_marginalize]
-                weight = weight[:,~to_marginalize]
-                confidence = confidence[~to_marginalize]
-                delta_norm = delta_norm[~to_marginalize]
-
-            self.active_target = target.detach().float()
-            self.active_weight = weight.detach().float()
-            self.active_confidence = confidence.detach().float()
-            self.active_delta_norm = delta_norm.detach().float()
-        else:
-            target = None
-            weight = None
+                self.marginalize_factors(to_marginalize, self.active_target, self.active_weight)
 
         # Decay frozen edge weights so stale targets fade out gracefully.
         if self.marg_weight.numel() > 0:
@@ -519,7 +581,7 @@ class DEVO:
 
         lmbda = torch.as_tensor([1e-4], device="cuda")
         self.validate_marginalized_factors()
-        ba_ii, ba_jj, ba_kk, ba_target, ba_weight = self.ba_factors(target, weight)
+        ba_ii, ba_jj, ba_kk, ba_target, ba_weight = self.ba_factors()
 
         with Timer("BA", enabled=self.enable_timing):
             t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
