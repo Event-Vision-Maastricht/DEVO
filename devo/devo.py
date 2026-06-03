@@ -302,6 +302,7 @@ class DEVO:
         max_active_edges = getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", 0)
         force_budget = getattr(self.cfg, "MARGINALIZE_FORCE_BUDGET", False)
         force_delta_thresh = getattr(self.cfg, "MARGINALIZE_FORCE_DELTA_THRESH", 1.0)
+        freeze_delta_weight = getattr(self.cfg, "MARGINALIZE_FREEZE_DELTA_WEIGHT", 1.0)
 
         patch_frame = self.ix[self.kk]
         newest_core = max(self.n - core_window, 0)
@@ -324,7 +325,7 @@ class DEVO:
         if num_to_freeze <= 0:
             return torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
 
-        score = confidence - delta_norm
+        score = confidence - freeze_delta_weight * delta_norm
         score = score.masked_fill(~freeze_pool, -torch.inf)
         _, freeze_idx = torch.topk(score, k=num_to_freeze)
 
@@ -368,6 +369,10 @@ class DEVO:
     def prune_marginalized_factors(self):
         max_frozen_edges = getattr(self.cfg, "MARGINALIZE_MAX_FROZEN_EDGES", 0)
         if max_frozen_edges <= 0 or len(self.marg_ii) <= max_frozen_edges:
+            return
+
+        interval = max(getattr(self.cfg, "MARGINALIZE_PRUNE_INTERVAL", 1), 1)
+        if self.marginalize_update_count % interval != 0:
             return
 
         score = self.marg_weight[0].mean(dim=-1)
