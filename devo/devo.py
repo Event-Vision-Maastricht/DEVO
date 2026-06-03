@@ -96,6 +96,7 @@ class DEVO:
         self.active_confidence = torch.as_tensor([], dtype=torch.float, device="cuda")
         self.active_delta_norm = torch.as_tensor([], dtype=torch.float, device="cuda")
         self.active_keepalive = torch.as_tensor([], dtype=torch.long, device="cuda")
+        self.active_refresh_age = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_ii = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_jj = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_kk = torch.as_tensor([], dtype=torch.long, device="cuda")
@@ -429,6 +430,9 @@ class DEVO:
         self.active_keepalive = torch.cat([
             self.active_keepalive,
             torch.zeros(len(ii), dtype=torch.long, device="cuda")])
+        self.active_refresh_age = torch.cat([
+            self.active_refresh_age,
+            torch.zeros(len(ii), dtype=torch.long, device="cuda")])
 
     def remove_factors(self, m):
         self.ii = self.ii[~m]
@@ -441,6 +445,7 @@ class DEVO:
         self.active_confidence = self.active_confidence[~m]
         self.active_delta_norm = self.active_delta_norm[~m]
         self.active_keepalive = self.active_keepalive[~m]
+        self.active_refresh_age = self.active_refresh_age[~m]
         if m.any():
             self.bump_graph_version()
 
@@ -508,6 +513,9 @@ class DEVO:
         self.active_keepalive = torch.cat([
             self.active_keepalive,
             torch.full((num,), keepalive, dtype=torch.long, device="cuda")])
+        self.active_refresh_age = torch.cat([
+            self.active_refresh_age,
+            torch.zeros(num, dtype=torch.long, device="cuda")])
         self.remove_marginalized_factors(m)
 
     def current_active_budget(self):
@@ -577,10 +585,12 @@ class DEVO:
         newest_core = max(self.n - core_window, 0)
         core = (self.ii >= newest_core) | (self.jj >= newest_core)
         fresh = torch.isinf(self.active_delta_norm) | (self.active_weight[0].mean(dim=-1) <= 0)
+        max_skip = getattr(self.cfg, "WARM_MAX_SKIP_FRAMES", 2)
+        stale = self.active_refresh_age >= max_skip
 
         stable_conf = getattr(self.cfg, "WARM_STABLE_CONF_THRESH", 0.6)
         stable_delta = getattr(self.cfg, "WARM_STABLE_DELTA_THRESH", 0.35)
-        skip_pool = (~core) & (~fresh) & \
+        skip_pool = (~core) & (~fresh) & (~stale) & \
             (self.active_confidence >= stable_conf) & \
             (self.active_delta_norm <= stable_delta)
 
@@ -936,12 +946,15 @@ class DEVO:
                     self.active_delta = delta.detach().float()
                     self.active_confidence = confidence.detach().float()
                     self.active_delta_norm = delta_norm.detach().float()
+                    self.active_refresh_age.zero_()
                 else:
+                    self.active_refresh_age += 1
                     self.active_target[:,neural] = target.detach().float()
                     self.active_weight[:,neural] = weight.detach().float()
                     self.active_delta[:,neural] = delta.detach().float()
                     self.active_confidence[neural] = confidence.detach().float()
                     self.active_delta_norm[neural] = delta_norm.detach().float()
+                    self.active_refresh_age[neural] = 0
                 self.update_active_budget(confidence, delta_norm)
 
             to_marginalize = self.select_marginalized_factors(
