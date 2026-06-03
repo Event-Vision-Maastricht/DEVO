@@ -104,6 +104,7 @@ class DEVO:
         self.marg_weight = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
         self.marg_weight_scale = torch.zeros(1, 0, 1, dtype=torch.float, device="cuda")
         self.marginalize_update_count = 0
+        self.marginalize_freeze_cooldown = 0
         self.active_edge_budget = getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", 0)
         self.neural_edge_budget = getattr(self.cfg, "WARM_BASE_NEURAL_EDGES", 0)
         
@@ -478,9 +479,15 @@ class DEVO:
         if hard:
             target_active = getattr(self.cfg, "MARGINALIZE_HARD_ACTIVE_EDGES", 3800)
             target_neural = getattr(self.cfg, "WARM_HARD_NEURAL_EDGES", 2600)
+            self.marginalize_freeze_cooldown = max(
+                self.marginalize_freeze_cooldown,
+                getattr(self.cfg, "MARGINALIZE_HARD_FREEZE_COOLDOWN", 0))
         elif medium:
             target_active = getattr(self.cfg, "MARGINALIZE_BASE_ACTIVE_EDGES", 3200)
             target_neural = getattr(self.cfg, "WARM_BASE_NEURAL_EDGES", 2100)
+            self.marginalize_freeze_cooldown = max(
+                self.marginalize_freeze_cooldown,
+                getattr(self.cfg, "MARGINALIZE_MEDIUM_FREEZE_COOLDOWN", 0))
         else:
             target_active = getattr(self.cfg, "MARGINALIZE_MIN_ACTIVE_EDGES", 3000)
             target_neural = getattr(self.cfg, "WARM_MIN_NEURAL_EDGES", 1800)
@@ -563,6 +570,9 @@ class DEVO:
 
     def select_marginalized_factors(self, confidence, delta_norm, enforce_budget=False):
         if not self.marginalization_enabled() or len(self.ii) == 0:
+            return torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
+
+        if self.marginalize_freeze_cooldown > 0:
             return torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
 
         weight_thresh = getattr(self.cfg, "MARGINALIZE_WEIGHT_THRESH", 0.75)
@@ -702,7 +712,7 @@ class DEVO:
 
     def print_marginalization_stats(self):
         if getattr(self.cfg, "MARGINALIZE_PRINT_STATS", False):
-            print(f"edges active={len(self.ii)} frozen={len(self.marg_ii)} active_budget={self.current_active_budget()} neural_budget={self.neural_edge_budget}")
+            print(f"edges active={len(self.ii)} frozen={len(self.marg_ii)} active_budget={self.current_active_budget()} neural_budget={self.neural_edge_budget} freeze_cooldown={self.marginalize_freeze_cooldown}")
 
     def ba_factors(self, target=None, weight=None):
         use_frozen = getattr(self.cfg, "MARGINALIZE_USE_FROZEN_IN_BA", True)
@@ -861,6 +871,9 @@ class DEVO:
 
         if self.active_keepalive.numel() > 0:
             self.active_keepalive = torch.clamp(self.active_keepalive - 1, min=0)
+
+        if self.marginalize_freeze_cooldown > 0:
+            self.marginalize_freeze_cooldown -= 1
 
         # Decay frozen edge weights so stale targets fade out gracefully.
         if self.marg_weight.numel() > 0:
