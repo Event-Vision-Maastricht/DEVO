@@ -34,6 +34,8 @@ class DEVO:
         self.enable_timing = False # TODO timing in param
 
         self.viz_flow = viz_flow
+        self.maintain_auxiliary_geometry = viz or viz_flow or \
+            getattr(self.cfg, "MAINTAIN_AUXILIARY_GEOMETRY", False)
         
         self.n = 0      # active keyframes/frames (every frames == keyframe)
         self.m = 0      # number active patches
@@ -109,6 +111,12 @@ class DEVO:
         self.neural_edge_budget = getattr(self.cfg, "WARM_BASE_NEURAL_EDGES", 0)
         self.graph_version = 0
         self.update_topology_cache = {}
+        self.update_graph = None
+        self.update_graph_enabled = getattr(self.cfg, "CUDA_GRAPH_UPDATE", False)
+        self.update_graph_failed = False
+        self.update_graph_shape = None
+        self.update_graph_static = {}
+        self.update_graph_outputs = None
         
         # initialize poses to identity matrix
         self.poses_[:,6] = 1.0
@@ -256,6 +264,98 @@ class DEVO:
                 self.update_op_compiled = False
                 return self.update_op(net, ctx, corr, flow, ii, jj, kk, topology)
             raise
+
+    def can_use_update_graph(self, net, ctx, corr, ii, jj, kk, topology):
+        if not self.update_graph_enabled or self.update_graph_failed:
+            return False
+        if topology is None or not torch.cuda.is_available():
+            return False
+
+        cap = getattr(self.cfg, "CUDA_GRAPH_UPDATE_EDGES", 0)
+        if cap <= 0:
+            cap = getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", 0)
+
+        min_ratio = getattr(self.cfg, "CUDA_GRAPH_MIN_EDGE_RATIO", 0.85)
+        return cap > 0 and len(ii) <= cap and len(ii) >= int(cap * min_ratio)
+
+    def run_update_net_graph(self, net, ctx, corr, ii, jj, kk, topology):
+        cap = getattr(self.cfg, "CUDA_GRAPH_UPDATE_EDGES", 0)
+        if cap <= 0:
+            cap = getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", len(ii))
+
+        valid = len(ii)
+        shape = (cap, net.dtype, corr.dtype, ctx.dtype, net.device)
+
+        try:
+            if self.update_graph is None or self.update_graph_shape != shape:
+                self.capture_update_graph(cap, net, ctx, corr)
+
+            static = self.update_graph_static
+            static["net"].zero_()
+            static["ctx"].zero_()
+            static["corr"].zero_()
+            static["ii"].fill_(0)
+            static["jj"].fill_(0)
+            static["kk"].fill_(0)
+            static["topology"]["ix"].fill_(-1)
+            static["topology"]["jx"].fill_(-1)
+            static["topology"]["kk_group"].copy_(static["default_group"])
+            static["topology"]["ij_group"].copy_(static["default_group"])
+
+            static["net"][:,:valid].copy_(net)
+            static["ctx"][:,:valid].copy_(ctx)
+            static["corr"][:,:valid].copy_(corr)
+            static["ii"][:valid].copy_(ii)
+            static["jj"][:valid].copy_(jj)
+            static["kk"][:valid].copy_(kk)
+            for name in ("ix", "jx", "kk_group", "ij_group"):
+                static["topology"][name][:valid].copy_(topology[name])
+
+            self.update_graph.replay()
+            net_out, delta, weight = self.update_graph_outputs
+            return net_out[:,:valid], (delta[:,:valid], weight[:,:valid], None)
+        except Exception as e:
+            print(f"Warning: CUDA graph update disabled ({e})")
+            self.update_graph_failed = True
+            return self.run_update_net(net, ctx, corr, None, ii, jj, kk, topology)
+
+    def capture_update_graph(self, cap, net, ctx, corr):
+        static_topology = {
+            "ix": torch.full((cap,), -1, dtype=torch.long, device="cuda"),
+            "jx": torch.full((cap,), -1, dtype=torch.long, device="cuda"),
+            "kk_group": torch.arange(cap, dtype=torch.long, device="cuda"),
+            "ij_group": torch.arange(cap, dtype=torch.long, device="cuda"),
+        }
+        static = {
+            "net": torch.zeros(1, cap, self.dim_inet, dtype=net.dtype, device=net.device),
+            "ctx": torch.zeros(1, cap, self.dim_inet, dtype=ctx.dtype, device=ctx.device),
+            "corr": torch.zeros(1, cap, corr.shape[-1], dtype=corr.dtype, device=corr.device),
+            "ii": torch.zeros(cap, dtype=torch.long, device="cuda"),
+            "jj": torch.zeros(cap, dtype=torch.long, device="cuda"),
+            "kk": torch.zeros(cap, dtype=torch.long, device="cuda"),
+            "topology": static_topology,
+            "default_group": torch.arange(cap, dtype=torch.long, device="cuda"),
+        }
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(getattr(self.cfg, "CUDA_GRAPH_WARMUP", 3)):
+                self.update_op(
+                    static["net"], static["ctx"], static["corr"], None,
+                    static["ii"], static["jj"], static["kk"], static_topology)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            net_out, (delta, weight, _) = self.update_op(
+                static["net"], static["ctx"], static["corr"], None,
+                static["ii"], static["jj"], static["kk"], static_topology)
+
+        self.update_graph = graph
+        self.update_graph_static = static
+        self.update_graph_outputs = (net_out, delta, weight)
+        self.update_graph_shape = (cap, net.dtype, corr.dtype, ctx.dtype, net.device)
 
 
     def start_viewer(self):
@@ -876,10 +976,12 @@ class DEVO:
 
             for i in range(k, self.n-1):
                 self.tstamps_[i] = self.tstamps_[i+1]
-                self.colors_[i] = self.colors_[i+1]
+                if self.maintain_auxiliary_geometry:
+                    self.colors_[i] = self.colors_[i+1]
                 self.poses_[i] = self.poses_[i+1]
                 self.patches_[i] = self.patches_[i+1]
-                self.patches_gt_[i] = self.patches_gt_[i+1]
+                if self.maintain_auxiliary_geometry:
+                    self.patches_gt_[i] = self.patches_gt_[i+1]
                 self.intrinsics_[i] = self.intrinsics_[i+1]
 
                 self.imap_[i%self.mem] = self.imap_[(i+1) % self.mem]
@@ -918,8 +1020,12 @@ class DEVO:
                         ctx = self.imap[:,kk % (self.M * self.mem)]
                         topology = self.update_topology(ii, jj, kk, cacheable=all_neural)
                         with Timer("other", enabled=self.enable_timing):
-                            net, (delta, weight, _) = \
-                                self.run_update_net(net_in, ctx, corr, None, ii, jj, kk, topology)
+                            if self.can_use_update_graph(net_in, ctx, corr, ii, jj, kk, topology):
+                                net, (delta, weight, _) = \
+                                    self.run_update_net_graph(net_in, ctx, corr, ii, jj, kk, topology)
+                            else:
+                                net, (delta, weight, _) = \
+                                    self.run_update_net(net_in, ctx, corr, None, ii, jj, kk, topology)
 
                 if all_neural:
                     self.net = net
@@ -975,9 +1081,10 @@ class DEVO:
                 except:
                     print("Warning BA failed...")
             
-            points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
-            points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
-            self.points_[:len(points)] = points[:]
+            if self.maintain_auxiliary_geometry:
+                points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
+                points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
+                self.points_[:len(points)] = points[:]
 
     def flow_viz_step(self):
         # [DEBUG]
@@ -1126,14 +1233,21 @@ class DEVO:
         # TODO patches with depth is available (val)
         with torch.inference_mode():
             with autocast(enabled=self.cfg.MIXED_PRECISION):
-                fmap, gmap, imap, patches, _, clr = \
-                    self.network.patchify(image,
-                        patches_per_image=self.cfg.PATCHES_PER_FRAME,
-                        return_color=True,
-                        scorer_eval_mode=self.cfg.SCORER_EVAL_MODE,
-                        scorer_eval_use_grid=self.cfg.SCORER_EVAL_USE_GRID)
+                patchify_out = self.network.patchify(
+                    image,
+                    patches_per_image=self.cfg.PATCHES_PER_FRAME,
+                    return_color=self.maintain_auxiliary_geometry,
+                    scorer_eval_mode=self.cfg.SCORER_EVAL_MODE,
+                    scorer_eval_use_grid=self.cfg.SCORER_EVAL_USE_GRID)
 
-        self.patches_gt_[self.n] = patches.clone()
+                if self.maintain_auxiliary_geometry:
+                    fmap, gmap, imap, patches, _, clr = patchify_out
+                else:
+                    fmap, gmap, imap, patches, _ = patchify_out
+                    clr = None
+
+        if self.maintain_auxiliary_geometry:
+            self.patches_gt_[self.n] = patches.clone()
 
         ### update state attributes ###
         self.tlist.append(tstamp)
@@ -1141,12 +1255,13 @@ class DEVO:
         self.intrinsics_[self.n] = intrinsics / self.RES
         
         # color info for visualization
-        if not self.evs:
-            clr = (clr[0,:,[2,1,0]] + 0.5) * (255.0 / 2)
-            self.colors_[self.n] = clr.to(torch.uint8)
-        else:
-            clr = (clr[0,:,[0,0,0]] + 0.5) * (255.0 / 2)
-            self.colors_[self.n] = clr.to(torch.uint8)
+        if self.maintain_auxiliary_geometry:
+            if not self.evs:
+                clr = (clr[0,:,[2,1,0]] + 0.5) * (255.0 / 2)
+                self.colors_[self.n] = clr.to(torch.uint8)
+            else:
+                clr = (clr[0,:,[0,0,0]] + 0.5) * (255.0 / 2)
+                self.colors_[self.n] = clr.to(torch.uint8)
             
 
         self.index_[self.n + 1] = self.n + 1

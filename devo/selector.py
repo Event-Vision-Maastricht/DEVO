@@ -59,7 +59,6 @@ class PatchSelector():
         self.NMS_RADIUS = 1.5
         self.NMS_IOU = 0.4
         self.NMS_CANDIDATE_FACTOR = 4
-        self.DIVERSE_ANCHOR_RATIO = 0.25
         
     def _grid(self, scores):
         b, n, h1, w1 = scores.shape
@@ -197,24 +196,16 @@ class PatchSelector():
         return (x,y)
 
     def _diverse_topk(self, scores, patches_per_image):
-        """score-anchored deterministic top-k with local spatial diversity.
+        """deterministic top-k with local spatial diversity.
 
-        Keep a small anchor set of the strongest scorer responses, then fill
-        the remaining budget with locally diverse maxima. This preserves the
-        robust high-score patches that pure top-k relies on while avoiding a
-        fully clustered patch set.
+        This keeps the same scorer objective as topk, but first applies local
+        max suppression on the score map. It avoids selecting many adjacent
+        patches on the same high-response structure, which gives BA/update a
+        better-conditioned set of constraints for the same or smaller budget.
         """
         b, n, h, w = scores.shape
         bn = b * n
         flat_scores = scores.view(bn, 1, h, w)
-        flat = scores.view(bn, -1)
-        candidate_k = min(
-            max(patches_per_image * self.NMS_CANDIDATE_FACTOR, patches_per_image),
-            flat.shape[-1])
-        _, fallback = torch.topk(flat, candidate_k, dim=-1)
-
-        anchor_k = min(max(int(round(patches_per_image * self.DIVERSE_ANCHOR_RATIO)), 1), patches_per_image)
-        anchors = fallback[:, :anchor_k]
 
         radius = int(max(self.NMS_RADIUS, 1))
         kernel = 2 * radius + 1
@@ -225,21 +216,23 @@ class PatchSelector():
         k = min(patches_per_image, suppressed.shape[-1])
         vals, idx = torch.topk(suppressed, k, dim=-1)
 
-        idx = self._fill_diverse_indices(idx, vals, fallback, patches_per_image, anchors=anchors)
+        if k < patches_per_image or torch.isinf(vals).any():
+            fallback_k = min(
+                max(patches_per_image * self.NMS_CANDIDATE_FACTOR, patches_per_image),
+                suppressed.shape[-1])
+            _, fallback = torch.topk(scores.view(bn, -1), fallback_k, dim=-1)
+            idx = self._fill_diverse_indices(idx, vals, fallback, patches_per_image)
 
         x = idx % w
         y = torch.div(idx, w, rounding_mode='floor')
         return (x, y)
 
-    def _fill_diverse_indices(self, idx, vals, fallback, patches_per_image, anchors=None):
+    def _fill_diverse_indices(self, idx, vals, fallback, patches_per_image):
         """Fill rare NMS underflows with ordinary top-k candidates."""
         rows = []
         for r in range(idx.shape[0]):
             valid = idx[r][torch.isfinite(vals[r])]
-            if anchors is None:
-                merged = torch.cat([valid, fallback[r]])
-            else:
-                merged = torch.cat([anchors[r], valid, fallback[r]])
+            merged = torch.cat([valid, fallback[r]])
             keep = torch.ones_like(merged, dtype=torch.bool)
             for i in range(merged.shape[0]):
                 if keep[i]:
