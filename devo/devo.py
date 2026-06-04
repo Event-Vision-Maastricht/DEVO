@@ -11,7 +11,7 @@ from .lietorch import SE3
 from .enet import eVONet
 from .utils import *
 from . import projective_ops as pops
-from .blocks import SoftAggBasic
+from .blocks import FusedSoftAgg, SoftAggBasic
 
 autocast = torch.cuda.amp.autocast
 Id = SE3.Identity(1, device="cuda")
@@ -160,6 +160,7 @@ class DEVO:
         self.network.cuda()
         self.network.eval()
         self.configure_update_aggregation()
+        self.configure_inference_runtime()
         self.network.requires_grad_(False)
         self.update_op = self.network.update
         self.update_op_compiled = False
@@ -176,10 +177,11 @@ class DEVO:
             except Exception as e:
                 print(f"Warning: update_net compile disabled ({e})")
 
-        # if self.cfg.MIXED_PRECISION:
-        #     self.network.half()
-
     def configure_update_aggregation(self):
+        if getattr(self.cfg, "FUSED_SOFTAGG", False):
+            self.network.update.agg_kk = FusedSoftAgg(self.network.update.agg_kk)
+            self.network.update.agg_ij = FusedSoftAgg(self.network.update.agg_ij)
+
         if not getattr(self.cfg, "SCALAR_SOFTAGG", False):
             return
 
@@ -197,6 +199,20 @@ class DEVO:
 
         return scalar
 
+    def configure_inference_runtime(self):
+        if getattr(self.cfg, "CUDNN_BENCHMARK", False):
+            torch.backends.cudnn.benchmark = True
+
+        if getattr(self.cfg, "ALLOW_TF32", False):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        if getattr(self.cfg, "HALF_INFERENCE_MODEL", False):
+            if not self.cfg.MIXED_PRECISION:
+                print("Warning: HALF_INFERENCE_MODEL requires MIXED_PRECISION; leaving model in fp32")
+                return
+            self.network.half()
+
     def bump_graph_version(self):
         self.graph_version += 1
         self.update_topology_cache = {}
@@ -213,13 +229,15 @@ class DEVO:
                 return cached
 
         ix, jx = self.temporal_neighbors(kk, jj)
-        _, kk_group = torch.unique(kk, return_inverse=True)
-        _, ij_group = torch.unique(ii * 12345 + jj, return_inverse=True)
+        kk_unique, kk_group = torch.unique(kk, return_inverse=True)
+        ij_unique, ij_group = torch.unique(ii * 12345 + jj, return_inverse=True)
         topology = {
             "ix": ix,
             "jx": jx,
             "kk_group": kk_group,
             "ij_group": ij_group,
+            "kk_num_groups": kk_unique.shape[0],
+            "ij_num_groups": ij_unique.shape[0],
         }
 
         if key is not None:
@@ -860,7 +878,8 @@ class DEVO:
 
     def prune_marginalized_factors(self):
         max_frozen_edges = getattr(self.cfg, "MARGINALIZE_MAX_FROZEN_EDGES", 0)
-        if max_frozen_edges <= 0 or len(self.marg_ii) <= max_frozen_edges:
+        min_weight = getattr(self.cfg, "MARGINALIZE_MIN_WEIGHT_PRUNE", 0.0)
+        if max_frozen_edges <= 0 and min_weight <= 0:
             return
 
         interval = max(getattr(self.cfg, "MARGINALIZE_PRUNE_INTERVAL", 1), 1)
@@ -868,10 +887,42 @@ class DEVO:
             return
 
         score = self.marg_weight[0].mean(dim=-1)
+        if min_weight > 0:
+            weak = score < min_weight
+            if weak.any():
+                self.remove_marginalized_factors(weak)
+                if len(self.marg_ii) == 0:
+                    return
+                score = self.marg_weight[0].mean(dim=-1)
+
+        if max_frozen_edges <= 0 or len(self.marg_ii) <= max_frozen_edges:
+            return
+
         _, keep_idx = torch.topk(score, k=max_frozen_edges)
         keep = torch.zeros(len(self.marg_ii), dtype=torch.bool, device="cuda")
         keep[keep_idx] = True
         self.remove_marginalized_factors(~keep)
+
+    def frozen_weight_decay(self):
+        base = getattr(self.cfg, "MARGINALIZE_WEIGHT_DECAY", 0.99)
+        if not getattr(self.cfg, "MARGINALIZE_ADAPTIVE_WEIGHT_DECAY", False):
+            return base
+        if self.active_delta_norm.numel() == 0 or self.active_confidence.numel() == 0:
+            return base
+
+        delta_thresh = getattr(self.cfg, "MARGINALIZE_DECAY_DELTA_THRESH", 0.70)
+        conf_thresh = getattr(self.cfg, "MARGINALIZE_DECAY_CONF_THRESH", 0.45)
+        hard_ratio_thresh = getattr(self.cfg, "MARGINALIZE_DECAY_HARD_RATIO", 0.12)
+        fast_decay = getattr(self.cfg, "MARGINALIZE_FAST_WEIGHT_DECAY", 0.94)
+
+        finite_delta = torch.where(
+            torch.isfinite(self.active_delta_norm),
+            self.active_delta_norm,
+            torch.full_like(self.active_delta_norm, delta_thresh + 1.0))
+        hard = (finite_delta > delta_thresh) | (self.active_confidence < conf_thresh)
+        hard_ratio = hard.float().mean()
+        blend = (hard_ratio / max(hard_ratio_thresh, 1e-6)).clamp(0.0, 1.0)
+        return base + blend * (fast_decay - base)
 
     def print_marginalization_stats(self):
         if getattr(self.cfg, "MARGINALIZE_PRINT_STATS", False):
@@ -1062,8 +1113,9 @@ class DEVO:
 
         # Decay frozen edge weights so stale targets fade out gracefully.
         if self.marg_weight.numel() > 0:
-            decay = getattr(self.cfg, "MARGINALIZE_WEIGHT_DECAY", 0.99)
+            decay = self.frozen_weight_decay()
             self.marg_weight *= decay
+            self.prune_marginalized_factors()
 
         lmbda = torch.as_tensor([1e-4], device="cuda")
         self.validate_marginalized_factors()

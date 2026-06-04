@@ -86,11 +86,15 @@ class Update(nn.Module):
             ix, jx = fastba.neighbors(kk, jj)
             kk_group = None
             ij_group = None
+            kk_num_groups = None
+            ij_num_groups = None
         else:
             ix = topology["ix"]
             jx = topology["jx"]
             kk_group = topology["kk_group"]
             ij_group = topology["ij_group"]
+            kk_num_groups = topology.get("kk_num_groups")
+            ij_num_groups = topology.get("ij_num_groups")
 
         mask_ix = (ix >= 0).float().reshape(1, -1, 1)
         mask_jx = (jx >= 0).float().reshape(1, -1, 1)
@@ -98,8 +102,8 @@ class Update(nn.Module):
         net = net + self.c1(mask_ix * net[:,ix])
         net = net + self.c2(mask_jx * net[:,jx])
 
-        net = net + self.agg_kk(net, kk, kk_group)
-        net = net + self.agg_ij(net, ii*12345 + jj, ij_group)
+        net = net + self.agg_kk(net, kk, kk_group, kk_num_groups)
+        net = net + self.agg_ij(net, ii*12345 + jj, ij_group, ij_num_groups)
 
         net = self.gru(net)
         weights = self.w(net)

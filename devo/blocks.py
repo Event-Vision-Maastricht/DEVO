@@ -4,6 +4,11 @@ import torch.nn.functional as F
 
 import torch_scatter
 
+try:
+    import cuda_softagg
+except ImportError:
+    cuda_softagg = None
+
 class LayerNorm1D(nn.Module):
     def __init__(self, dim):
         super(LayerNorm1D, self).__init__()
@@ -37,7 +42,7 @@ class SoftAgg(nn.Module):
         self.g = nn.Linear(self.dim, self.dim)
         self.h = nn.Linear(self.dim, self.dim)
 
-    def forward(self, x, ix, jx=None):
+    def forward(self, x, ix, jx=None, num_groups=None):
         if jx is None:
             _, jx = torch.unique(ix, return_inverse=True)
 
@@ -49,6 +54,45 @@ class SoftAgg(nn.Module):
             
         return self.h(y)
 
+class FusedSoftAgg(nn.Module):
+    def __init__(self, agg):
+        super(FusedSoftAgg, self).__init__()
+        self.dim = agg.dim
+        self.expand = agg.expand
+        self.f = agg.f
+        self.g = agg.g
+        self.h = agg.h
+
+    def forward(self, x, ix, jx=None, num_groups=None):
+        if cuda_softagg is None or x.shape[0] != 1 or not x.is_cuda:
+            if jx is None:
+                _, jx = torch.unique(ix, return_inverse=True)
+            w = torch_scatter.scatter_softmax(self.g(x), jx, dim=1)
+            y = torch_scatter.scatter_sum(self.f(x) * w, jx, dim=1)
+            if self.expand:
+                return self.h(y)[:,jx]
+            return self.h(y)
+
+        if jx is None:
+            _, jx = torch.unique(ix, return_inverse=True)
+            num_groups = None
+
+        if num_groups is None:
+            # Fallback for non-topology calls. This path is rare; topology calls
+            # pass an exact group count and avoid empty-group work.
+            num_groups = x.shape[1]
+
+        y = cuda_softagg.forward(
+            self.f(x)[0].contiguous(),
+            self.g(x)[0].contiguous(),
+            jx.contiguous(),
+            num_groups).unsqueeze(0)
+
+        if self.expand:
+            return self.h(y)[:,jx]
+
+        return self.h(y)
+
 class SoftAggBasic(nn.Module):
     def __init__(self, dim=512, expand=True):
         super(SoftAggBasic, self).__init__()
@@ -58,7 +102,7 @@ class SoftAggBasic(nn.Module):
         self.g = nn.Linear(self.dim,        1)
         self.h = nn.Linear(self.dim, self.dim)
 
-    def forward(self, x, ix, jx=None):
+    def forward(self, x, ix, jx=None, num_groups=None):
         if jx is None:
             _, jx = torch.unique(ix, return_inverse=True)
 
