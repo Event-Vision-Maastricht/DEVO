@@ -24,6 +24,7 @@ _C.EDGE_THINNING = False
 _C.EDGE_THIN_DENSE_WINDOW = 3
 _C.EDGE_THIN_STRIDE = 2
 _C.CORR_SINGLE_LEVEL = False
+_C.FUSED_CORR_INTERP = True
 
 # Active-to-frozen edge marginalization. Frozen edges skip corr/update and keep
 # contributing their last target and confidence directly to BA.
@@ -70,7 +71,7 @@ _C.COMPILE_UPDATE_FALLBACK = True
 _C.SCALAR_SOFTAGG = False
 _C.UPDATE_TOPOLOGY_CACHE = True
 _C.UPDATE_GPU_TOPOLOGY = True
-_C.EDGE_ORDERING_ENABLED = True
+_C.EDGE_ORDERING_ENABLED = False
 _C.MARGINALIZE_FORCE_BUDGET = True
 _C.MARGINALIZE_USE_FROZEN_IN_BA = True
 _C.MARGINALIZE_REFRESH_TARGETS = False
@@ -114,5 +115,8 @@ _C.MOTION_MODEL = 'DAMPED_LINEAR'
 _C.MOTION_DAMPING = 0.5
 
 _C.MIXED_PRECISION = True
+_C.CUDNN_BENCHMARK = False
+_C.ALLOW_TF32 = False
+_C.FLOAT32_MATMUL_PRECISION = "highest"
 
 cfg = _C

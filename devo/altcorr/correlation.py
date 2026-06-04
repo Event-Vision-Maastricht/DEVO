@@ -3,12 +3,16 @@ import cuda_corr
 
 class CorrLayer(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, fmap1, fmap2, coords, ii, jj, radius, dropout):
+    def forward(ctx, fmap1, fmap2, coords, ii, jj, radius, dropout, fused):
         """ forward correlation """
         ctx.save_for_backward(fmap1, fmap2, coords, ii, jj)
         ctx.radius = radius
         ctx.dropout = dropout
-        corr, = cuda_corr.forward(fmap1, fmap2, coords, ii, jj, radius)
+
+        if fused and hasattr(cuda_corr, "forward_fused"):
+            corr, = cuda_corr.forward_fused(fmap1, fmap2, coords, ii, jj, radius)
+        else:
+            corr, = cuda_corr.forward(fmap1, fmap2, coords, ii, jj, radius)
 
         return corr
 
@@ -27,7 +31,7 @@ class CorrLayer(torch.autograd.Function):
         fmap1_grad, fmap2_grad = \
             cuda_corr.backward(fmap1, fmap2, coords, ii, jj, grad, ctx.radius)
 
-        return fmap1_grad, fmap2_grad, None, None, None, None, None
+        return fmap1_grad, fmap2_grad, None, None, None, None, None, None
 
 
 class PatchLayer(torch.autograd.Function):
@@ -68,7 +72,6 @@ def patchify(net, coords, radius, mode='bilinear'):
     return patches
     
 
-def corr(fmap1, fmap2, coords, ii, jj, radius=1, dropout=1):
-    return CorrLayer.apply(fmap1, fmap2, coords, ii, jj, radius, dropout)
-
+def corr(fmap1, fmap2, coords, ii, jj, radius=1, dropout=1, fused=False):
+    return CorrLayer.apply(fmap1, fmap2, coords, ii, jj, radius, dropout, fused)
 

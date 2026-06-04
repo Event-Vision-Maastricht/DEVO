@@ -10,6 +10,14 @@ std::vector<torch::Tensor> corr_cuda_forward(
     torch::Tensor jj,
     int radius);
 
+std::vector<torch::Tensor> corr_cuda_forward_fused(
+    torch::Tensor fmap1,
+    torch::Tensor fmap2,
+    torch::Tensor coords,
+    torch::Tensor ii,
+    torch::Tensor jj,
+    int radius);
+
 std::vector<torch::Tensor> corr_cuda_backward(
   torch::Tensor fmap1,
   torch::Tensor fmap2,
@@ -34,6 +42,15 @@ std::vector<torch::Tensor> corr_forward(
   return corr_cuda_forward(fmap1, fmap2, coords, ii, jj, radius);
 }
 
+std::vector<torch::Tensor> corr_forward_fused(
+    torch::Tensor fmap1,
+    torch::Tensor fmap2,
+    torch::Tensor coords,
+    torch::Tensor ii,
+    torch::Tensor jj, int radius) {
+  return corr_cuda_forward_fused(fmap1, fmap2, coords, ii, jj, radius);
+}
+
 std::vector<torch::Tensor> corr_backward(
     torch::Tensor fmap1,
     torch::Tensor fmap2,
@@ -56,6 +73,7 @@ std::vector<torch::Tensor> patchify_backward(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward", &corr_forward, "CORR forward");
+  m.def("forward_fused", &corr_forward_fused, "CORR fused forward");
   m.def("backward", &corr_backward, "CORR backward");
 
   m.def("patchify_forward", &patchify_forward, "PATCHIFY forward");

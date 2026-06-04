@@ -23,6 +23,7 @@ class DEVO:
     def __init__(self, cfg, network, evs=False, ht=480, wd=640, viz=False, viz_flow=False, dim_inet=384, dim_fnet=128, dim=32):
         self.cfg = cfg
         self.evs = evs
+        self.configure_torch_runtime()
 
         self.dim_inet = dim_inet
         self.dim_fnet = dim_fnet
@@ -121,6 +122,17 @@ class DEVO:
         self.viewer = None
         if viz:
             self.start_viewer()
+
+    def configure_torch_runtime(self):
+        if getattr(self.cfg, "CUDNN_BENCHMARK", False):
+            torch.backends.cudnn.benchmark = True
+
+        if getattr(self.cfg, "ALLOW_TF32", False):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            if hasattr(torch, "set_float32_matmul_precision"):
+                torch.set_float32_matmul_precision(
+                    getattr(self.cfg, "FLOAT32_MATMUL_PRECISION", "high"))
 
     def load_weights(self, network):
         # load network from checkpoint file
@@ -419,11 +431,12 @@ class DEVO:
         ii, jj = indicies if indicies is not None else (self.kk, self.jj)
         ii1 = ii % (self.M * self.mem)
         jj1 = jj % (self.mem)
-        corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3)
+        fused_corr = getattr(self.cfg, "FUSED_CORR_INTERP", False)
+        corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3, fused=fused_corr)
         if getattr(self.cfg, "CORR_SINGLE_LEVEL", False):
             corr2 = torch.zeros_like(corr1)
         else:
-            corr2 = altcorr.corr(self.gmap, self.pyramid[1], coords / 4, ii1, jj1, 3)
+            corr2 = altcorr.corr(self.gmap, self.pyramid[1], coords / 4, ii1, jj1, 3, fused=fused_corr)
         return torch.stack([corr1, corr2], -1).view(1, len(ii), -1)
 
     def reproject(self, indicies=None):
