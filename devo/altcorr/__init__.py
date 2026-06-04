@@ -1,1 +1,1 @@
-from .correlation import corr, corr_pyramid, patchify
+from .correlation import corr, patchify

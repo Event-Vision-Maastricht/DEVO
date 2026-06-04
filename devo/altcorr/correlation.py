@@ -71,11 +71,4 @@ def patchify(net, coords, radius, mode='bilinear'):
 def corr(fmap1, fmap2, coords, ii, jj, radius=1, dropout=1):
     return CorrLayer.apply(fmap1, fmap2, coords, ii, jj, radius, dropout)
 
-def corr_pyramid(fmap1, fmap2a, fmap2b, coords1, coords2, ii, jj, radius=1):
-    if not hasattr(cuda_corr, "forward_pyramid"):
-        corr1 = corr(fmap1, fmap2a, coords1, ii, jj, radius)
-        corr2 = corr(fmap1, fmap2b, coords2, ii, jj, radius)
-        return torch.stack([corr1, corr2], -1).view(coords1.shape[0], len(ii), -1)
 
-    packed, = cuda_corr.forward_pyramid(fmap1, fmap2a, fmap2b, coords1, coords2, ii, jj, radius)
-    return packed

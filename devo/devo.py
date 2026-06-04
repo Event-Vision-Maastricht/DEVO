@@ -98,7 +98,6 @@ class DEVO:
         self.active_confidence = torch.as_tensor([], dtype=torch.float, device="cuda")
         self.active_delta_norm = torch.as_tensor([], dtype=torch.float, device="cuda")
         self.active_keepalive = torch.as_tensor([], dtype=torch.long, device="cuda")
-        self.active_warm_age = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_ii = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_jj = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_kk = torch.as_tensor([], dtype=torch.long, device="cuda")
@@ -518,9 +517,6 @@ class DEVO:
         ii, jj = indicies if indicies is not None else (self.kk, self.jj)
         ii1 = ii % (self.M * self.mem)
         jj1 = jj % (self.mem)
-        if getattr(self.cfg, "FUSED_CORR_PYRAMID", False) and not getattr(self.cfg, "CORR_SINGLE_LEVEL", False):
-            return altcorr.corr_pyramid(self.gmap, self.pyramid[0], self.pyramid[1], coords, coords / 4, ii1, jj1, 3)
-
         corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3)
         if getattr(self.cfg, "CORR_SINGLE_LEVEL", False):
             corr2 = torch.zeros_like(corr1)
@@ -562,9 +558,6 @@ class DEVO:
         self.active_keepalive = torch.cat([
             self.active_keepalive,
             torch.zeros(len(ii), dtype=torch.long, device="cuda")])
-        self.active_warm_age = torch.cat([
-            self.active_warm_age,
-            torch.zeros(len(ii), dtype=torch.long, device="cuda")])
 
     def remove_factors(self, m):
         self.ii = self.ii[~m]
@@ -577,7 +570,6 @@ class DEVO:
         self.active_confidence = self.active_confidence[~m]
         self.active_delta_norm = self.active_delta_norm[~m]
         self.active_keepalive = self.active_keepalive[~m]
-        self.active_warm_age = self.active_warm_age[~m]
         if m.any():
             self.bump_graph_version()
 
@@ -645,9 +637,6 @@ class DEVO:
         self.active_keepalive = torch.cat([
             self.active_keepalive,
             torch.full((num,), keepalive, dtype=torch.long, device="cuda")])
-        self.active_warm_age = torch.cat([
-            self.active_warm_age,
-            torch.zeros(num, dtype=torch.long, device="cuda")])
         self.remove_marginalized_factors(m)
 
     def current_active_budget(self):
@@ -720,11 +709,7 @@ class DEVO:
 
         stable_conf = getattr(self.cfg, "WARM_STABLE_CONF_THRESH", 0.6)
         stable_delta = getattr(self.cfg, "WARM_STABLE_DELTA_THRESH", 0.35)
-        max_skip = getattr(self.cfg, "WARM_MAX_SKIP_FRAMES", 0)
-        refresh_due = (self.active_warm_age >= max_skip) if max_skip > 0 else \
-            torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
         skip_pool = (~core) & (~fresh) & \
-            (~refresh_due) & \
             (self.active_confidence >= stable_conf) & \
             (self.active_delta_norm <= stable_delta)
 
@@ -1089,12 +1074,7 @@ class DEVO:
                 kk = self.kk if all_neural else self.kk[neural]
                 net_in = self.net if all_neural else self.net[:,neural]
                 with torch.inference_mode():
-                    coords_all = None
-                    if all_neural or not getattr(self.cfg, "WARM_REFRESH_SKIPPED_TARGETS", True):
-                        coords = self.reproject(indicies=(ii, jj, kk))
-                    else:
-                        coords_all = self.reproject(indicies=(self.ii, self.jj, self.kk))
-                        coords = coords_all[:,neural]
+                    coords = self.reproject(indicies=(ii, jj, kk))
 
                     with autocast(enabled=True):
 
@@ -1124,37 +1104,13 @@ class DEVO:
                     self.active_delta = delta.detach().float()
                     self.active_confidence = confidence.detach().float()
                     self.active_delta_norm = delta_norm.detach().float()
-                    if self.active_warm_age.numel() == len(self.ii):
-                        self.active_warm_age.zero_()
                 else:
                     self.active_target[:,neural] = target.detach().float()
                     self.active_weight[:,neural] = weight.detach().float()
                     self.active_delta[:,neural] = delta.detach().float()
                     self.active_confidence[neural] = confidence.detach().float()
                     self.active_delta_norm[neural] = delta_norm.detach().float()
-                    self.active_warm_age[neural] = 0
-                    skipped = ~neural
-                    if getattr(self.cfg, "WARM_REFRESH_SKIPPED_TARGETS", True):
-                        if skipped.any():
-                            skip_coords = coords_all[:,skipped] if coords_all is not None else \
-                                self.reproject(indicies=(self.ii[skipped], self.jj[skipped], self.kk[skipped]))
-                            skip_center = skip_coords[...,self.P//2,self.P//2]
-                            self.active_target[:,skipped] = (
-                                skip_center + self.active_delta[:,skipped]).detach().float()
-                            decay = getattr(self.cfg, "WARM_SKIPPED_WEIGHT_DECAY", 1.0)
-                            if decay < 1.0:
-                                self.active_weight[:,skipped] = (
-                                    self.active_weight[:,skipped] * decay).detach().float()
-                                self.active_confidence[skipped] = (
-                                    self.active_weight[0,skipped].mean(dim=-1)).detach().float()
-                    if skipped.any():
-                        self.active_warm_age[skipped] += 1
-
-                self.update_active_budget(self.active_confidence, self.active_delta_norm)
-                if getattr(self.cfg, "WARM_PRINT_STATS", False) and not all_neural:
-                    print(
-                        f"warm active={len(self.ii)} neural={neural.sum().item()} "
-                        f"skipped={(~neural).sum().item()} budget={self.neural_edge_budget}")
+                self.update_active_budget(confidence, delta_norm)
 
             to_marginalize = self.select_marginalized_factors(
                 self.active_confidence, self.active_delta_norm)

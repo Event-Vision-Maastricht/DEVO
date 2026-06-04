@@ -88,10 +88,6 @@ class Update(nn.Module):
             ij_group = None
             kk_num_groups = None
             ij_num_groups = None
-            kk_order = None
-            ij_order = None
-            kk_offsets = None
-            ij_offsets = None
         else:
             ix = topology["ix"]
             jx = topology["jx"]
@@ -99,10 +95,6 @@ class Update(nn.Module):
             ij_group = topology["ij_group"]
             kk_num_groups = topology.get("kk_num_groups")
             ij_num_groups = topology.get("ij_num_groups")
-            kk_order = topology.get("kk_order")
-            ij_order = topology.get("ij_order")
-            kk_offsets = topology.get("kk_offsets")
-            ij_offsets = topology.get("ij_offsets")
 
         mask_ix = (ix >= 0).float().reshape(1, -1, 1)
         mask_jx = (jx >= 0).float().reshape(1, -1, 1)
@@ -110,8 +102,8 @@ class Update(nn.Module):
         net = net + self.c1(mask_ix * net[:,ix])
         net = net + self.c2(mask_jx * net[:,jx])
 
-        net = net + self.agg_kk(net, kk, kk_group, kk_num_groups, kk_order, kk_offsets)
-        net = net + self.agg_ij(net, ii*12345 + jj, ij_group, ij_num_groups, ij_order, ij_offsets)
+        net = net + self.agg_kk(net, kk, kk_group, kk_num_groups)
+        net = net + self.agg_ij(net, ii*12345 + jj, ij_group, ij_num_groups)
 
         net = self.gru(net)
         weights = self.w(net)
