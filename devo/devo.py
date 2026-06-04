@@ -11,6 +11,7 @@ from .lietorch import SE3
 from .enet import eVONet
 from .utils import *
 from . import projective_ops as pops
+from .blocks import FusedSoftAgg, SoftAggBasic
 
 autocast = torch.cuda.amp.autocast
 Id = SE3.Identity(1, device="cuda")
@@ -33,6 +34,8 @@ class DEVO:
         self.enable_timing = False # TODO timing in param
 
         self.viz_flow = viz_flow
+        self.maintain_auxiliary_geometry = viz or viz_flow or \
+            getattr(self.cfg, "MAINTAIN_AUXILIARY_GEOMETRY", False)
         
         self.n = 0      # active keyframes/frames (every frames == keyframe)
         self.m = 0      # number active patches
@@ -89,6 +92,31 @@ class DEVO:
         self.ii = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.jj = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.kk = torch.as_tensor([], dtype=torch.long, device="cuda")
+        self.active_target = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
+        self.active_weight = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
+        self.active_delta = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
+        self.active_confidence = torch.as_tensor([], dtype=torch.float, device="cuda")
+        self.active_delta_norm = torch.as_tensor([], dtype=torch.float, device="cuda")
+        self.active_keepalive = torch.as_tensor([], dtype=torch.long, device="cuda")
+        self.marg_ii = torch.as_tensor([], dtype=torch.long, device="cuda")
+        self.marg_jj = torch.as_tensor([], dtype=torch.long, device="cuda")
+        self.marg_kk = torch.as_tensor([], dtype=torch.long, device="cuda")
+        self.marg_target = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
+        self.marg_delta = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
+        self.marg_weight = torch.zeros(1, 0, 2, dtype=torch.float, device="cuda")
+        self.marg_weight_scale = torch.zeros(1, 0, 1, dtype=torch.float, device="cuda")
+        self.marginalize_update_count = 0
+        self.marginalize_freeze_cooldown = 0
+        self.active_edge_budget = getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", 0)
+        self.neural_edge_budget = getattr(self.cfg, "WARM_BASE_NEURAL_EDGES", 0)
+        self.graph_version = 0
+        self.update_topology_cache = {}
+        self.update_graph = None
+        self.update_graph_enabled = getattr(self.cfg, "CUDA_GRAPH_UPDATE", False)
+        self.update_graph_failed = False
+        self.update_graph_shape = None
+        self.update_graph_static = {}
+        self.update_graph_outputs = None
         
         # initialize poses to identity matrix
         self.poses_[:,6] = 1.0
@@ -131,9 +159,232 @@ class DEVO:
 
         self.network.cuda()
         self.network.eval()
+        self.configure_update_aggregation()
+        self.configure_inference_runtime()
+        self.network.requires_grad_(False)
+        self.update_op = self.network.update
+        self.update_op_compiled = False
 
-        # if self.cfg.MIXED_PRECISION:
-        #     self.network.half()
+        if getattr(self.cfg, "COMPILE_UPDATE_NET", False) and hasattr(torch, "compile"):
+            try:
+                if hasattr(torch, "_dynamo"):
+                    torch._dynamo.config.suppress_errors = True
+                self.update_op = torch.compile(
+                    self.network.update,
+                    mode=getattr(self.cfg, "COMPILE_UPDATE_MODE", "reduce-overhead"),
+                    dynamic=getattr(self.cfg, "COMPILE_UPDATE_DYNAMIC", True))
+                self.update_op_compiled = True
+            except Exception as e:
+                print(f"Warning: update_net compile disabled ({e})")
+
+    def configure_update_aggregation(self):
+        if getattr(self.cfg, "FUSED_SOFTAGG", False):
+            agg_kk = FusedSoftAgg(self.network.update.agg_kk)
+            agg_ij = FusedSoftAgg(self.network.update.agg_ij)
+
+            if getattr(self.cfg, "FUSED_SOFTAGG_VALIDATE", True):
+                atol = getattr(self.cfg, "FUSED_SOFTAGG_ATOL", 1e-3)
+                rtol = getattr(self.cfg, "FUSED_SOFTAGG_RTOL", 1e-3)
+                ok_kk = agg_kk.validate_kernel(atol=atol, rtol=rtol)
+                ok_ij = agg_ij.validate_kernel(atol=atol, rtol=rtol)
+                if not (ok_kk and ok_ij):
+                    print("Warning: fused SoftAgg validation failed; using torch_scatter fallback")
+
+            self.network.update.agg_kk = agg_kk
+            self.network.update.agg_ij = agg_ij
+
+        if not getattr(self.cfg, "SCALAR_SOFTAGG", False):
+            return
+
+        self.network.update.agg_kk = self.scalarize_softagg(self.network.update.agg_kk)
+        self.network.update.agg_ij = self.scalarize_softagg(self.network.update.agg_ij)
+
+    def scalarize_softagg(self, agg):
+        scalar = SoftAggBasic(agg.dim, expand=agg.expand).to(next(agg.parameters()).device)
+        scalar.f.load_state_dict(agg.f.state_dict())
+        scalar.h.load_state_dict(agg.h.state_dict())
+
+        with torch.no_grad():
+            scalar.g.weight.copy_(agg.g.weight.mean(dim=0, keepdim=True))
+            scalar.g.bias.copy_(agg.g.bias.mean().view(1))
+
+        return scalar
+
+    def configure_inference_runtime(self):
+        if getattr(self.cfg, "CUDNN_BENCHMARK", False):
+            torch.backends.cudnn.benchmark = True
+
+        if getattr(self.cfg, "ALLOW_TF32", False):
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+
+        if getattr(self.cfg, "HALF_INFERENCE_MODEL", False):
+            if not self.cfg.MIXED_PRECISION:
+                print("Warning: HALF_INFERENCE_MODEL requires MIXED_PRECISION; leaving model in fp32")
+                return
+            self.network.half()
+
+    def bump_graph_version(self):
+        self.graph_version += 1
+        self.update_topology_cache = {}
+
+    def update_topology(self, ii, jj, kk, cacheable=False):
+        if not getattr(self.cfg, "UPDATE_TOPOLOGY_CACHE", False):
+            return None
+
+        key = None
+        if cacheable:
+            key = (self.graph_version, len(ii), ii.data_ptr(), jj.data_ptr(), kk.data_ptr())
+            cached = self.update_topology_cache.get(key)
+            if cached is not None:
+                return cached
+
+        ix, jx = self.temporal_neighbors(kk, jj)
+        kk_unique, kk_group = torch.unique(kk, return_inverse=True)
+        ij_unique, ij_group = torch.unique(ii * 12345 + jj, return_inverse=True)
+        topology = {
+            "ix": ix,
+            "jx": jx,
+            "kk_group": kk_group,
+            "ij_group": ij_group,
+            "kk_num_groups": kk_unique.shape[0],
+            "ij_num_groups": ij_unique.shape[0],
+        }
+
+        if key is not None:
+            self.update_topology_cache[key] = topology
+
+        return topology
+
+    def temporal_neighbors(self, kk, jj):
+        if not getattr(self.cfg, "UPDATE_GPU_TOPOLOGY", True) or len(kk) == 0:
+            return fastba.neighbors(kk, jj)
+
+        try:
+            key_stride = max(getattr(self.cfg, "BUFFER_SIZE", self.N), self.N) + 1
+            edge_stride = len(kk) + 1
+            edge_order = torch.arange(len(kk), dtype=kk.dtype, device=kk.device)
+            order = torch.argsort((kk * key_stride + jj) * edge_stride + edge_order)
+            kk_sorted = kk[order]
+
+            prev_sorted = torch.full_like(order, -1)
+            next_sorted = torch.full_like(order, -1)
+
+            if len(order) > 1:
+                same_prev = kk_sorted[1:] == kk_sorted[:-1]
+                prev_sorted[1:] = torch.where(same_prev, order[:-1], prev_sorted[1:])
+                next_sorted[:-1] = torch.where(same_prev, order[1:], next_sorted[:-1])
+
+            ix = torch.empty_like(order)
+            jx = torch.empty_like(order)
+            ix[order] = prev_sorted
+            jx[order] = next_sorted
+            return ix, jx
+        except TypeError:
+            return fastba.neighbors(kk, jj)
+
+    def run_update_net(self, net, ctx, corr, flow, ii, jj, kk, topology=None):
+        try:
+            return self.update_op(net, ctx, corr, flow, ii, jj, kk, topology)
+        except Exception as e:
+            if self.update_op_compiled and getattr(self.cfg, "COMPILE_UPDATE_FALLBACK", True):
+                print(f"Warning: compiled update_net failed; falling back ({e})")
+                self.update_op = self.network.update
+                self.update_op_compiled = False
+                return self.update_op(net, ctx, corr, flow, ii, jj, kk, topology)
+            raise
+
+    def can_use_update_graph(self, net, ctx, corr, ii, jj, kk, topology):
+        if not self.update_graph_enabled or self.update_graph_failed:
+            return False
+        if topology is None or not torch.cuda.is_available():
+            return False
+
+        cap = getattr(self.cfg, "CUDA_GRAPH_UPDATE_EDGES", 0)
+        if cap <= 0:
+            cap = getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", 0)
+
+        min_ratio = getattr(self.cfg, "CUDA_GRAPH_MIN_EDGE_RATIO", 0.85)
+        return cap > 0 and len(ii) <= cap and len(ii) >= int(cap * min_ratio)
+
+    def run_update_net_graph(self, net, ctx, corr, ii, jj, kk, topology):
+        cap = getattr(self.cfg, "CUDA_GRAPH_UPDATE_EDGES", 0)
+        if cap <= 0:
+            cap = getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", len(ii))
+
+        valid = len(ii)
+        shape = (cap, net.dtype, corr.dtype, ctx.dtype, net.device)
+
+        try:
+            if self.update_graph is None or self.update_graph_shape != shape:
+                self.capture_update_graph(cap, net, ctx, corr)
+
+            static = self.update_graph_static
+            static["net"].zero_()
+            static["ctx"].zero_()
+            static["corr"].zero_()
+            static["ii"].fill_(0)
+            static["jj"].fill_(0)
+            static["kk"].fill_(0)
+            static["topology"]["ix"].fill_(-1)
+            static["topology"]["jx"].fill_(-1)
+            static["topology"]["kk_group"].copy_(static["default_group"])
+            static["topology"]["ij_group"].copy_(static["default_group"])
+
+            static["net"][:,:valid].copy_(net)
+            static["ctx"][:,:valid].copy_(ctx)
+            static["corr"][:,:valid].copy_(corr)
+            static["ii"][:valid].copy_(ii)
+            static["jj"][:valid].copy_(jj)
+            static["kk"][:valid].copy_(kk)
+            for name in ("ix", "jx", "kk_group", "ij_group"):
+                static["topology"][name][:valid].copy_(topology[name])
+
+            self.update_graph.replay()
+            net_out, delta, weight = self.update_graph_outputs
+            return net_out[:,:valid], (delta[:,:valid], weight[:,:valid], None)
+        except Exception as e:
+            print(f"Warning: CUDA graph update disabled ({e})")
+            self.update_graph_failed = True
+            return self.run_update_net(net, ctx, corr, None, ii, jj, kk, topology)
+
+    def capture_update_graph(self, cap, net, ctx, corr):
+        static_topology = {
+            "ix": torch.full((cap,), -1, dtype=torch.long, device="cuda"),
+            "jx": torch.full((cap,), -1, dtype=torch.long, device="cuda"),
+            "kk_group": torch.arange(cap, dtype=torch.long, device="cuda"),
+            "ij_group": torch.arange(cap, dtype=torch.long, device="cuda"),
+        }
+        static = {
+            "net": torch.zeros(1, cap, self.dim_inet, dtype=net.dtype, device=net.device),
+            "ctx": torch.zeros(1, cap, self.dim_inet, dtype=ctx.dtype, device=ctx.device),
+            "corr": torch.zeros(1, cap, corr.shape[-1], dtype=corr.dtype, device=corr.device),
+            "ii": torch.zeros(cap, dtype=torch.long, device="cuda"),
+            "jj": torch.zeros(cap, dtype=torch.long, device="cuda"),
+            "kk": torch.zeros(cap, dtype=torch.long, device="cuda"),
+            "topology": static_topology,
+            "default_group": torch.arange(cap, dtype=torch.long, device="cuda"),
+        }
+
+        warmup_stream = torch.cuda.Stream()
+        warmup_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(warmup_stream):
+            for _ in range(getattr(self.cfg, "CUDA_GRAPH_WARMUP", 3)):
+                self.update_op(
+                    static["net"], static["ctx"], static["corr"], None,
+                    static["ii"], static["jj"], static["kk"], static_topology)
+        torch.cuda.current_stream().wait_stream(warmup_stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            net_out, (delta, weight, _) = self.update_op(
+                static["net"], static["ctx"], static["corr"], None,
+                static["ii"], static["jj"], static["kk"], static_topology)
+
+        self.update_graph = graph
+        self.update_graph_static = static
+        self.update_graph_outputs = (net_out, delta, weight)
+        self.update_graph_shape = (cap, net.dtype, corr.dtype, ctx.dtype, net.device)
 
 
     def start_viewer(self):
@@ -186,6 +437,7 @@ class DEVO:
     def terminate(self):
         """ interpolate missing poses """
         print("keyframes", self.n)
+        self.final_refine()
         self.traj = {}
         for i in range(self.n):
             self.traj[self.tstamps_[i].item()] = self.poses_[i]
@@ -194,6 +446,7 @@ class DEVO:
             poses = [self.get_pose(t) for t in range(self.counter)]
             poses = lietorch.stack(poses, dim=0)
             poses = poses.inv().data.cpu().numpy()
+            poses = self.smooth_trajectory(poses)
         else:
             print(f"Warning: Model is not initialized. Using Identity.") # eval still runs bug
             id = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
@@ -206,6 +459,58 @@ class DEVO:
             self.viewer.join()
 
         return poses, tstamps
+
+    def smooth_trajectory(self, poses):
+        if not getattr(self.cfg, "TRAJECTORY_SMOOTHING", False) or len(poses) < 3:
+            return poses
+
+        alpha = getattr(self.cfg, "TRAJECTORY_SMOOTHING_ALPHA", 0.25)
+        passes = max(getattr(self.cfg, "TRAJECTORY_SMOOTHING_PASSES", 1), 1)
+        alpha = min(max(alpha, 0.0), 0.5)
+        smoothed = poses.copy()
+
+        for _ in range(passes):
+            prev = smoothed[:-2]
+            curr = smoothed[1:-1]
+            nxt = smoothed[2:]
+
+            out = smoothed.copy()
+            out[1:-1, :3] = alpha * prev[:, :3] + (1.0 - 2.0 * alpha) * curr[:, :3] + alpha * nxt[:, :3]
+
+            qprev = prev[:, 3:7]
+            qcurr = curr[:, 3:7]
+            qnext = nxt[:, 3:7]
+            qprev = np.where((qprev * qcurr).sum(axis=1, keepdims=True) < 0, -qprev, qprev)
+            qnext = np.where((qnext * qcurr).sum(axis=1, keepdims=True) < 0, -qnext, qnext)
+            q = alpha * qprev + (1.0 - 2.0 * alpha) * qcurr + alpha * qnext
+            q = q / np.maximum(np.linalg.norm(q, axis=1, keepdims=True), 1e-8)
+            out[1:-1, 3:7] = q
+            smoothed = out
+
+        return smoothed
+
+    def final_refine(self):
+        if not self.is_initialized or not getattr(self.cfg, "FINAL_BA_ENABLED", False):
+            return
+
+        ba_ii, ba_jj, ba_kk, ba_target, ba_weight = self.ba_factors()
+        if len(ba_ii) == 0:
+            return
+
+        lmbda = torch.as_tensor([1e-4], device="cuda")
+        window = getattr(self.cfg, "FINAL_BA_WINDOW", 0)
+        t0 = 1 if window <= 0 else max(self.n - window, 1)
+        rounds = max(getattr(self.cfg, "FINAL_BA_ROUNDS", 1), 1)
+        iterations = max(getattr(self.cfg, "FINAL_BA_ITERATIONS", 6), 1)
+
+        for _ in range(rounds):
+            try:
+                fastba.BA(self.poses, self.patches, self.intrinsics,
+                    ba_target, ba_weight, lmbda, ba_ii, ba_jj, ba_kk, t0, self.n,
+                    iterations)
+            except:
+                print("Warning final BA failed...")
+                return
     
     def corr(self, coords, indicies=None):
         """ local correlation volume """
@@ -213,7 +518,10 @@ class DEVO:
         ii1 = ii % (self.M * self.mem)
         jj1 = jj % (self.mem)
         corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3)
-        corr2 = altcorr.corr(self.gmap, self.pyramid[1], coords / 4, ii1, jj1, 3)
+        if getattr(self.cfg, "CORR_SINGLE_LEVEL", False):
+            corr2 = torch.zeros_like(corr1)
+        else:
+            corr2 = altcorr.corr(self.gmap, self.pyramid[1], coords / 4, ii1, jj1, 3)
         return torch.stack([corr1, corr2], -1).view(1, len(ii), -1)
 
     def reproject(self, indicies=None):
@@ -226,17 +534,444 @@ class DEVO:
         self.jj = torch.cat([self.jj, jj])
         self.kk = torch.cat([self.kk, ii])
         self.ii = torch.cat([self.ii, self.ix[ii]]) 
+        self.bump_graph_version()
         # TODO: self.ix.shape = self.M*self.N
         # self.ix is filled dynamically
 
         net = torch.zeros(1, len(ii), self.dim_inet, **self.kwargs)
         self.net = torch.cat([self.net, net], dim=1)
+        self.active_target = torch.cat([
+            self.active_target,
+            torch.zeros(1, len(ii), 2, dtype=torch.float, device="cuda")], dim=1)
+        self.active_weight = torch.cat([
+            self.active_weight,
+            torch.zeros(1, len(ii), 2, dtype=torch.float, device="cuda")], dim=1)
+        self.active_delta = torch.cat([
+            self.active_delta,
+            torch.zeros(1, len(ii), 2, dtype=torch.float, device="cuda")], dim=1)
+        self.active_confidence = torch.cat([
+            self.active_confidence,
+            torch.zeros(len(ii), dtype=torch.float, device="cuda")])
+        self.active_delta_norm = torch.cat([
+            self.active_delta_norm,
+            torch.full((len(ii),), torch.inf, dtype=torch.float, device="cuda")])
+        self.active_keepalive = torch.cat([
+            self.active_keepalive,
+            torch.zeros(len(ii), dtype=torch.long, device="cuda")])
 
     def remove_factors(self, m):
         self.ii = self.ii[~m]
         self.jj = self.jj[~m]
         self.kk = self.kk[~m]
         self.net = self.net[:,~m]
+        self.active_target = self.active_target[:,~m]
+        self.active_weight = self.active_weight[:,~m]
+        self.active_delta = self.active_delta[:,~m]
+        self.active_confidence = self.active_confidence[~m]
+        self.active_delta_norm = self.active_delta_norm[~m]
+        self.active_keepalive = self.active_keepalive[~m]
+        if m.any():
+            self.bump_graph_version()
+
+    def remove_marginalized_factors(self, m):
+        self.marg_ii = self.marg_ii[~m]
+        self.marg_jj = self.marg_jj[~m]
+        self.marg_kk = self.marg_kk[~m]
+        self.marg_target = self.marg_target[:,~m]
+        self.marg_delta = self.marg_delta[:,~m]
+        self.marg_weight = self.marg_weight[:,~m]
+        self.marg_weight_scale = self.marg_weight_scale[:,~m]
+
+    def remove_all_factors(self, m_active, m_marg=None):
+        self.remove_factors(m_active)
+        if m_marg is not None:
+            self.remove_marginalized_factors(m_marg)
+
+    def marginalization_enabled(self):
+        return getattr(self.cfg, "ACTIVE_EDGE_MARGINALIZATION", False)
+
+    def marginalize_factors(self, m, target, weight):
+        if m.sum().item() == 0:
+            return
+
+        if not getattr(self.cfg, "MARGINALIZE_USE_FROZEN_IN_BA", True):
+            self.remove_factors(m)
+            return
+
+        self.marg_ii = torch.cat([self.marg_ii, self.ii[m]])
+        self.marg_jj = torch.cat([self.marg_jj, self.jj[m]])
+        self.marg_kk = torch.cat([self.marg_kk, self.kk[m]])
+        self.marg_target = torch.cat([self.marg_target, target[:,m].detach().float()], dim=1)
+        self.marg_delta = torch.cat([self.marg_delta, self.active_delta[:,m].detach().float()], dim=1)
+        self.marg_weight = torch.cat([self.marg_weight, weight[:,m].detach().float()], dim=1)
+        scale = torch.ones(1, m.sum().item(), 1, dtype=torch.float, device="cuda")
+        self.marg_weight_scale = torch.cat([self.marg_weight_scale, scale], dim=1)
+        self.remove_factors(m)
+        self.prune_marginalized_factors()
+
+    def reactivate_marginalized_factors(self, m):
+        if m.sum().item() == 0:
+            return
+
+        num = m.sum().item()
+        self.ii = torch.cat([self.ii, self.marg_ii[m]])
+        self.jj = torch.cat([self.jj, self.marg_jj[m]])
+        self.kk = torch.cat([self.kk, self.marg_kk[m]])
+        self.bump_graph_version()
+
+        net = torch.zeros(1, num, self.dim_inet, **self.kwargs)
+        self.net = torch.cat([self.net, net], dim=1)
+
+        weight = self.marg_weight[:,m] * self.marg_weight_scale[:,m]
+        self.active_target = torch.cat([self.active_target, self.marg_target[:,m]], dim=1)
+        self.active_weight = torch.cat([self.active_weight, weight], dim=1)
+        self.active_delta = torch.cat([self.active_delta, self.marg_delta[:,m]], dim=1)
+        self.active_confidence = torch.cat([
+            self.active_confidence,
+            weight[0].mean(dim=-1).float()])
+        self.active_delta_norm = torch.cat([
+            self.active_delta_norm,
+            torch.full((num,), torch.inf, dtype=torch.float, device="cuda")])
+
+        keepalive = getattr(self.cfg, "MARGINALIZE_REACTIVATE_KEEPALIVE", 2)
+        self.active_keepalive = torch.cat([
+            self.active_keepalive,
+            torch.full((num,), keepalive, dtype=torch.long, device="cuda")])
+        self.remove_marginalized_factors(m)
+
+    def current_active_budget(self):
+        if not getattr(self.cfg, "MARGINALIZE_ADAPTIVE_BUDGET", False):
+            return getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", 0)
+        return self.active_edge_budget
+
+    def update_active_budget(self, confidence, delta_norm):
+        if not getattr(self.cfg, "MARGINALIZE_ADAPTIVE_BUDGET", False) or len(confidence) == 0:
+            self.active_edge_budget = getattr(self.cfg, "MARGINALIZE_MAX_ACTIVE_EDGES", 0)
+            return
+
+        interval = max(getattr(self.cfg, "MARGINALIZE_ADAPT_INTERVAL", 1), 1)
+        if self.marginalize_update_count % interval != 0:
+            return
+
+        finite_delta = torch.where(torch.isfinite(delta_norm), delta_norm, torch.zeros_like(delta_norm))
+        delta_thresh = getattr(self.cfg, "MARGINALIZE_ADAPT_DELTA_THRESH", 0.75)
+        conf_thresh = getattr(self.cfg, "MARGINALIZE_ADAPT_CONF_THRESH", 0.45)
+        motion_thresh = getattr(self.cfg, "MARGINALIZE_ADAPT_MOTION_THRESH", 0.45)
+        hard_motion_thresh = getattr(self.cfg, "MARGINALIZE_ADAPT_HARD_MOTION_THRESH", 0.8)
+
+        difficult = (finite_delta > delta_thresh) | (confidence < conf_thresh)
+        hard_ratio = difficult.float().mean().item()
+        motion = finite_delta.mean().item()
+
+        hard = hard_ratio >= getattr(self.cfg, "MARGINALIZE_ADAPT_HARD_RATIO", 0.25) or \
+            motion >= hard_motion_thresh
+        medium = hard_ratio >= getattr(self.cfg, "MARGINALIZE_ADAPT_MEDIUM_RATIO", 0.12) or \
+            motion >= motion_thresh
+
+        if hard:
+            target_active = getattr(self.cfg, "MARGINALIZE_HARD_ACTIVE_EDGES", 3800)
+            target_neural = getattr(self.cfg, "WARM_HARD_NEURAL_EDGES", 2600)
+            self.marginalize_freeze_cooldown = max(
+                self.marginalize_freeze_cooldown,
+                getattr(self.cfg, "MARGINALIZE_HARD_FREEZE_COOLDOWN", 0))
+        elif medium:
+            target_active = getattr(self.cfg, "MARGINALIZE_BASE_ACTIVE_EDGES", 3200)
+            target_neural = getattr(self.cfg, "WARM_BASE_NEURAL_EDGES", 2100)
+            self.marginalize_freeze_cooldown = max(
+                self.marginalize_freeze_cooldown,
+                getattr(self.cfg, "MARGINALIZE_MEDIUM_FREEZE_COOLDOWN", 0))
+        else:
+            target_active = getattr(self.cfg, "MARGINALIZE_MIN_ACTIVE_EDGES", 3000)
+            target_neural = getattr(self.cfg, "WARM_MIN_NEURAL_EDGES", 1800)
+
+        max_step = getattr(self.cfg, "MARGINALIZE_ADAPT_MAX_STEP", 400)
+        if self.active_edge_budget <= 0 or max_step <= 0:
+            self.active_edge_budget = target_active
+        elif target_active > self.active_edge_budget:
+            self.active_edge_budget = min(target_active, self.active_edge_budget + max_step)
+        else:
+            self.active_edge_budget = max(target_active, self.active_edge_budget - max_step)
+
+        self.neural_edge_budget = target_neural
+
+    def select_neural_factors(self):
+        if not getattr(self.cfg, "WARM_UPDATE_ENABLED", False) or len(self.ii) == 0:
+            return torch.ones(len(self.ii), dtype=torch.bool, device="cuda")
+
+        budget = self.neural_edge_budget
+        if budget <= 0 or len(self.ii) <= budget:
+            return torch.ones(len(self.ii), dtype=torch.bool, device="cuda")
+
+        core_window = getattr(self.cfg, "MARGINALIZE_CORE_WINDOW", 4)
+        newest_core = max(self.n - core_window, 0)
+        core = (self.ii >= newest_core) | (self.jj >= newest_core)
+        fresh = torch.isinf(self.active_delta_norm) | (self.active_weight[0].mean(dim=-1) <= 0)
+
+        stable_conf = getattr(self.cfg, "WARM_STABLE_CONF_THRESH", 0.6)
+        stable_delta = getattr(self.cfg, "WARM_STABLE_DELTA_THRESH", 0.35)
+        skip_pool = (~core) & (~fresh) & \
+            (self.active_confidence >= stable_conf) & \
+            (self.active_delta_norm <= stable_delta)
+
+        num_to_skip = min(len(self.ii) - budget, skip_pool.sum().item())
+        neural = torch.ones(len(self.ii), dtype=torch.bool, device="cuda")
+        if num_to_skip <= 0:
+            return neural
+
+        stability = self.active_confidence - getattr(self.cfg, "WARM_DELTA_WEIGHT", 2.0) * self.active_delta_norm
+        stability = stability.masked_fill(~skip_pool, -torch.inf)
+        _, skip_idx = torch.topk(stability, k=num_to_skip)
+        neural[skip_idx] = False
+        return neural
+
+    def select_adaptive_neural_factors(self):
+        base = self.select_neural_factors()
+        if not getattr(self.cfg, "ADAPTIVE_UPDATE_ENABLED", False) or len(self.ii) == 0:
+            return base
+
+        interval = max(getattr(self.cfg, "ADAPTIVE_FULL_UPDATE_INTERVAL", 2), 1)
+        if interval <= 1 or self.marginalize_update_count % interval == 0:
+            return base
+
+        fresh = torch.isinf(self.active_delta_norm) | (self.active_weight[0].mean(dim=-1) <= 0)
+
+        core_window = getattr(self.cfg, "ADAPTIVE_UPDATE_CORE_WINDOW", 1)
+        newest_core = max(self.n - core_window, 0)
+        core = (self.ii >= newest_core) | (self.jj >= newest_core)
+
+        hard_delta = getattr(self.cfg, "ADAPTIVE_UPDATE_DELTA_THRESH", 0.75)
+        hard_conf = getattr(self.cfg, "ADAPTIVE_UPDATE_CONF_THRESH", 0.45)
+        hard = torch.isfinite(self.active_delta_norm) & \
+            ((self.active_delta_norm >= hard_delta) | (self.active_confidence <= hard_conf))
+
+        neural = base & (fresh | core | hard)
+        min_edges = getattr(self.cfg, "ADAPTIVE_UPDATE_MIN_EDGES", 0)
+        if min_edges <= 0 or neural.sum().item() >= min_edges:
+            return neural
+
+        num_to_add = min(min_edges - neural.sum().item(), (base & (~neural)).sum().item())
+        if num_to_add <= 0:
+            return neural
+
+        score = self.active_delta_norm.float() - self.active_confidence.float()
+        score = torch.where(torch.isfinite(score), score, torch.zeros_like(score))
+        score = score.masked_fill(~(base & (~neural)), -torch.inf)
+        _, add_idx = torch.topk(score, k=num_to_add)
+        neural[add_idx] = True
+        return neural
+
+    def select_marginalized_factors(self, confidence, delta_norm, enforce_budget=False):
+        if not self.marginalization_enabled() or len(self.ii) == 0:
+            return torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
+
+        if self.marginalize_freeze_cooldown > 0:
+            return torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
+
+        weight_thresh = getattr(self.cfg, "MARGINALIZE_WEIGHT_THRESH", 0.75)
+        delta_thresh = getattr(self.cfg, "MARGINALIZE_DELTA_THRESH", 0.25)
+        min_age = getattr(self.cfg, "MARGINALIZE_MIN_AGE", 3)
+        core_window = getattr(self.cfg, "MARGINALIZE_CORE_WINDOW", 4)
+        max_active_edges = self.current_active_budget()
+        force_budget = getattr(self.cfg, "MARGINALIZE_FORCE_BUDGET", False)
+        force_delta_thresh = getattr(self.cfg, "MARGINALIZE_FORCE_DELTA_THRESH", 10.0)
+        freeze_delta_weight = getattr(self.cfg, "MARGINALIZE_FREEZE_DELTA_WEIGHT", 1.0)
+        protect_delta_thresh = getattr(self.cfg, "MARGINALIZE_PROTECT_DELTA_THRESH", 0.75)
+        protect_conf_thresh = getattr(self.cfg, "MARGINALIZE_PROTECT_CONF_THRESH", 0.45)
+        coverage_stride = getattr(self.cfg, "MARGINALIZE_COVERAGE_STRIDE", 0)
+        coverage_penalty = getattr(self.cfg, "MARGINALIZE_COVERAGE_PENALTY", 0.75)
+        age_weight = getattr(self.cfg, "MARGINALIZE_AGE_WEIGHT", 0.02)
+        backbone_window = getattr(self.cfg, "MARGINALIZE_BACKBONE_WINDOW", 0)
+        backbone_penalty = getattr(self.cfg, "MARGINALIZE_BACKBONE_PENALTY", 0.0)
+
+        patch_frame = self.ix[self.kk]
+        newest_core = max(self.n - core_window, 0)
+
+        old_enough = patch_frame <= self.n - min_age
+        outside_core = (self.ii < newest_core) & (self.jj < newest_core)
+        fresh = torch.isinf(delta_norm) | (self.active_weight[0].mean(dim=-1) <= 0)
+        finite = torch.isfinite(delta_norm) & torch.isfinite(confidence)
+        reusable = self.active_keepalive <= 0
+        candidates = old_enough & outside_core & reusable & (~fresh) & finite
+        protected = torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
+
+        if protect_delta_thresh > 0:
+            protected |= delta_norm >= protect_delta_thresh
+
+        if protect_conf_thresh > 0:
+            protected |= confidence <= protect_conf_thresh
+
+        coverage_anchor = torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
+        if coverage_stride > 1:
+            coverage_anchor = (self.kk % coverage_stride) == 0
+
+        converged = (confidence >= weight_thresh) & \
+            (delta_norm <= delta_thresh) & candidates & (~protected)
+
+        if not enforce_budget or max_active_edges <= 0 or len(self.ii) <= max_active_edges:
+            return converged
+
+        num_to_freeze = len(self.ii) - max_active_edges
+        if force_budget:
+            freeze_pool = candidates & (delta_norm <= force_delta_thresh)
+        else:
+            freeze_pool = converged & (~protected)
+
+        num_to_freeze = min(num_to_freeze, freeze_pool.sum().item())
+        if num_to_freeze <= 0:
+            return torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
+
+        age = (self.n - patch_frame).float()
+        score = confidence - freeze_delta_weight * delta_norm + age_weight * age
+        score = score - coverage_penalty * coverage_anchor.float()
+        if backbone_window > 0 and backbone_penalty > 0:
+            temporal_backbone = (self.ii - self.jj).abs() <= backbone_window
+            score = score - backbone_penalty * temporal_backbone.float()
+        score = score - 10.0 * protected.float()
+        score = score.masked_fill(~freeze_pool, -torch.inf)
+        _, freeze_idx = torch.topk(score, k=num_to_freeze)
+
+        to_freeze = torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
+        to_freeze[freeze_idx] = True
+        return to_freeze
+
+    def marginalize_cached_factors(self):
+        to_marginalize = self.select_marginalized_factors(
+            self.active_confidence, self.active_delta_norm, enforce_budget=True)
+        self.marginalize_factors(to_marginalize, self.active_target, self.active_weight)
+
+    def validate_marginalized_factors(self):
+        if not getattr(self.cfg, "MARGINALIZE_USE_FROZEN_IN_BA", True):
+            return
+
+        if not getattr(self.cfg, "MARGINALIZE_VALIDATE_FROZEN", True) or len(self.marg_ii) == 0:
+            return
+
+        interval = max(getattr(self.cfg, "MARGINALIZE_VALIDATE_INTERVAL", 1), 1)
+        if self.marginalize_update_count % interval != 0:
+            return
+
+        coords = self.reproject(indicies=(self.marg_ii, self.marg_jj, self.marg_kk))
+        current = coords[...,self.P//2,self.P//2]
+        target = current + self.marg_delta if getattr(self.cfg, "MARGINALIZE_REFRESH_TARGETS", False) else self.marg_target
+        residual = (target - current).norm(dim=-1)[0]
+        soft_residual = getattr(self.cfg, "MARGINALIZE_SOFT_FROZEN_RESIDUAL", 2.0)
+        max_residual = getattr(self.cfg, "MARGINALIZE_MAX_FROZEN_RESIDUAL", 8.0)
+        min_scale = getattr(self.cfg, "MARGINALIZE_MIN_FROZEN_WEIGHT_SCALE", 0.2)
+
+        if max_residual > soft_residual:
+            scale = 1.0 - (residual - soft_residual) / (max_residual - soft_residual)
+            scale = scale.clamp(min=min_scale, max=1.0)
+            scale = torch.where(torch.isfinite(scale), scale, torch.zeros_like(scale))
+            self.marg_weight_scale = scale.view(1, -1, 1)
+
+        stale = (~torch.isfinite(residual)) | (residual > max_residual)
+
+        if getattr(self.cfg, "MARGINALIZE_REACTIVATE_FROZEN", False):
+            reactivate_residual = getattr(self.cfg, "MARGINALIZE_REACTIVATE_RESIDUAL", 4.0)
+            max_reactivate = getattr(self.cfg, "MARGINALIZE_MAX_REACTIVATE", 128)
+            reactivate_pool = torch.isfinite(residual) & \
+                (residual > reactivate_residual) & \
+                (residual <= max_residual)
+
+            num_reactivate = min(max_reactivate, reactivate_pool.sum().item())
+            if num_reactivate > 0:
+                score = residual.masked_fill(~reactivate_pool, -torch.inf)
+                _, reactivate_idx = torch.topk(score, k=num_reactivate)
+                reactivate = torch.zeros(len(self.marg_ii), dtype=torch.bool, device="cuda")
+                reactivate[reactivate_idx] = True
+                self.reactivate_marginalized_factors(reactivate)
+                stale = stale[~reactivate]
+
+        if stale.any():
+            self.remove_marginalized_factors(stale)
+
+        self.prune_marginalized_factors()
+
+    def prune_marginalized_factors(self):
+        max_frozen_edges = getattr(self.cfg, "MARGINALIZE_MAX_FROZEN_EDGES", 0)
+        min_weight = getattr(self.cfg, "MARGINALIZE_MIN_WEIGHT_PRUNE", 0.0)
+        if max_frozen_edges <= 0 and min_weight <= 0:
+            return
+
+        interval = max(getattr(self.cfg, "MARGINALIZE_PRUNE_INTERVAL", 1), 1)
+        if self.marginalize_update_count % interval != 0:
+            return
+
+        score = self.marg_weight[0].mean(dim=-1)
+        if min_weight > 0:
+            weak = score < min_weight
+            if weak.any():
+                self.remove_marginalized_factors(weak)
+                if len(self.marg_ii) == 0:
+                    return
+                score = self.marg_weight[0].mean(dim=-1)
+
+        if max_frozen_edges <= 0 or len(self.marg_ii) <= max_frozen_edges:
+            return
+
+        _, keep_idx = torch.topk(score, k=max_frozen_edges)
+        keep = torch.zeros(len(self.marg_ii), dtype=torch.bool, device="cuda")
+        keep[keep_idx] = True
+        self.remove_marginalized_factors(~keep)
+
+    def frozen_weight_decay(self):
+        base = getattr(self.cfg, "MARGINALIZE_WEIGHT_DECAY", 0.99)
+        if not getattr(self.cfg, "MARGINALIZE_ADAPTIVE_WEIGHT_DECAY", False):
+            return base
+        if self.active_delta_norm.numel() == 0 or self.active_confidence.numel() == 0:
+            return base
+
+        delta_thresh = getattr(self.cfg, "MARGINALIZE_DECAY_DELTA_THRESH", 0.70)
+        conf_thresh = getattr(self.cfg, "MARGINALIZE_DECAY_CONF_THRESH", 0.45)
+        hard_ratio_thresh = getattr(self.cfg, "MARGINALIZE_DECAY_HARD_RATIO", 0.12)
+        fast_decay = getattr(self.cfg, "MARGINALIZE_FAST_WEIGHT_DECAY", 0.94)
+
+        finite_delta = torch.where(
+            torch.isfinite(self.active_delta_norm),
+            self.active_delta_norm,
+            torch.full_like(self.active_delta_norm, delta_thresh + 1.0))
+        hard = (finite_delta > delta_thresh) | (self.active_confidence < conf_thresh)
+        hard_ratio = hard.float().mean()
+        blend = (hard_ratio / max(hard_ratio_thresh, 1e-6)).clamp(0.0, 1.0)
+        return base + blend * (fast_decay - base)
+
+    def print_marginalization_stats(self):
+        if getattr(self.cfg, "MARGINALIZE_PRINT_STATS", False):
+            print(f"edges active={len(self.ii)} frozen={len(self.marg_ii)} active_budget={self.current_active_budget()} neural_budget={self.neural_edge_budget} freeze_cooldown={self.marginalize_freeze_cooldown}")
+
+    def ba_factors(self, target=None, weight=None):
+        use_frozen = getattr(self.cfg, "MARGINALIZE_USE_FROZEN_IN_BA", True)
+        frozen_weight_scale = getattr(self.cfg, "MARGINALIZE_FROZEN_BA_WEIGHT", 1.0)
+        refresh_frozen = getattr(self.cfg, "MARGINALIZE_REFRESH_TARGETS", False)
+        if target is None:
+            if len(self.ii) == 0:
+                if not use_frozen:
+                    return self.ii, self.jj, self.kk, self.active_target, self.active_weight
+                marg_target = self.refreshed_marginalized_targets() if refresh_frozen else self.marg_target
+                return self.marg_ii, self.marg_jj, self.marg_kk, marg_target, \
+                    self.marg_weight * self.marg_weight_scale * frozen_weight_scale
+            target = self.active_target
+            weight = self.active_weight
+
+        if len(self.marg_ii) == 0 or not use_frozen:
+            return self.ii, self.jj, self.kk, target.float(), weight.float()
+
+        marg_target = self.refreshed_marginalized_targets() if refresh_frozen else self.marg_target
+        ii = torch.cat([self.ii, self.marg_ii])
+        jj = torch.cat([self.jj, self.marg_jj])
+        kk = torch.cat([self.kk, self.marg_kk])
+        target = torch.cat([target.float(), marg_target], dim=1)
+        marg_weight = self.marg_weight * self.marg_weight_scale * frozen_weight_scale
+        weight = torch.cat([weight.float(), marg_weight], dim=1)
+        return ii, jj, kk, target, weight
+
+    def refreshed_marginalized_targets(self):
+        if len(self.marg_ii) == 0:
+            return self.marg_target
+
+        coords = self.reproject(indicies=(self.marg_ii, self.marg_jj, self.marg_kk))
+        current = coords[...,self.P//2,self.P//2]
+        return current + self.marg_delta
 
     def motion_probe(self):
         """ kinda hacky way to ensure enough motion for initialization """
@@ -247,19 +982,29 @@ class DEVO:
         net = torch.zeros(1, len(ii), self.dim_inet, **self.kwargs)
         coords = self.reproject(indicies=(ii, jj, kk))
 
-        with autocast(enabled=self.cfg.MIXED_PRECISION):
-            corr = self.corr(coords, indicies=(kk, jj))
-            ctx = self.imap[:,kk % (self.M * self.mem)]
-            net, (delta, weight, _) = \
-                self.network.update(net, ctx, corr, None, ii, jj, kk)
+        with torch.inference_mode():
+            with autocast(enabled=self.cfg.MIXED_PRECISION):
+                corr = self.corr(coords, indicies=(kk, jj))
+                ctx = self.imap[:,kk % (self.M * self.mem)]
+                net, (delta, weight, _) = \
+                    self.run_update_net(net, ctx, corr, None, ii, jj, kk)
 
         return torch.quantile(delta.norm(dim=-1).float(), 0.5)
 
     def motionmag(self, i, j):
         k = (self.ii == i) & (self.jj == j)
-        ii = self.ii[k]
-        jj = self.jj[k]
-        kk = self.kk[k]
+        if getattr(self.cfg, "MARGINALIZE_USE_FROZEN_IN_BA", True):
+            mk = (self.marg_ii == i) & (self.marg_jj == j)
+            ii = torch.cat([self.ii[k], self.marg_ii[mk]])
+            jj = torch.cat([self.jj[k], self.marg_jj[mk]])
+            kk = torch.cat([self.kk[k], self.marg_kk[mk]])
+        else:
+            ii = self.ii[k]
+            jj = self.jj[k]
+            kk = self.kk[k]
+
+        if len(ii) == 0:
+            return float("inf")
 
         flow = pops.flow_mag(SE3(self.poses), self.patches, self.intrinsics, ii, jj, kk, beta=0.5)
         return flow.mean().item()
@@ -280,18 +1025,25 @@ class DEVO:
             self.delta[t1] = (t0, dP) # store relative pose between <t-5, t-4>
 
             to_remove = (self.ii == k) | (self.jj == k)
-            self.remove_factors(to_remove)
+            marg_to_remove = (self.marg_ii == k) | (self.marg_jj == k)
+            self.remove_all_factors(to_remove, marg_to_remove)
 
             self.kk[self.ii > k] -= self.M
             self.ii[self.ii > k] -= 1
             self.jj[self.jj > k] -= 1
+            self.marg_kk[self.marg_ii > k] -= self.M
+            self.marg_ii[self.marg_ii > k] -= 1
+            self.marg_jj[self.marg_jj > k] -= 1
+            self.bump_graph_version()
 
             for i in range(k, self.n-1):
                 self.tstamps_[i] = self.tstamps_[i+1]
-                self.colors_[i] = self.colors_[i+1]
+                if self.maintain_auxiliary_geometry:
+                    self.colors_[i] = self.colors_[i+1]
                 self.poses_[i] = self.poses_[i+1]
                 self.patches_[i] = self.patches_[i+1]
-                self.patches_gt_[i] = self.patches_gt_[i+1]
+                if self.maintain_auxiliary_geometry:
+                    self.patches_gt_[i] = self.patches_gt_[i+1]
                 self.intrinsics_[i] = self.intrinsics_[i+1]
 
                 self.imap_[i%self.mem] = self.imap_[(i+1) % self.mem]
@@ -303,45 +1055,99 @@ class DEVO:
             self.m -= self.M
 
         to_remove = self.ix[self.kk] < self.n - self.cfg.REMOVAL_WINDOW
-        self.remove_factors(to_remove)
+        marg_to_remove = self.ix[self.marg_kk] < self.n - self.cfg.REMOVAL_WINDOW
+        self.remove_all_factors(to_remove, marg_to_remove)
 
     def update(self):
-        coords = self.reproject()
+        self.marginalize_update_count += 1
+        self.marginalize_cached_factors()
+        self.print_marginalization_stats()
 
-        with autocast(enabled=True):
-            
-            corr = self.corr(coords)
-            ctx = self.imap[:,self.kk % (self.M * self.mem)]
-            with Timer("other", enabled=self.enable_timing):
-                self.net, (delta, weight, _) = \
-                    self.network.update(self.net, ctx, corr, None, self.ii, self.jj, self.kk)
+        if len(self.ii) > 0:
+            all_neural = not getattr(self.cfg, "WARM_UPDATE_ENABLED", False) and \
+                not getattr(self.cfg, "ADAPTIVE_UPDATE_ENABLED", False)
+            neural = None if all_neural else self.select_adaptive_neural_factors()
+
+            if all_neural or neural.any():
+                ii = self.ii if all_neural else self.ii[neural]
+                jj = self.jj if all_neural else self.jj[neural]
+                kk = self.kk if all_neural else self.kk[neural]
+                net_in = self.net if all_neural else self.net[:,neural]
+                with torch.inference_mode():
+                    coords = self.reproject(indicies=(ii, jj, kk))
+
+                    with autocast(enabled=True):
+
+                        corr = self.corr(coords, indicies=(kk, jj))
+                        ctx = self.imap[:,kk % (self.M * self.mem)]
+                        topology = self.update_topology(ii, jj, kk, cacheable=all_neural)
+                        with Timer("other", enabled=self.enable_timing):
+                            if self.can_use_update_graph(net_in, ctx, corr, ii, jj, kk, topology):
+                                net, (delta, weight, _) = \
+                                    self.run_update_net_graph(net_in, ctx, corr, ii, jj, kk, topology)
+                            else:
+                                net, (delta, weight, _) = \
+                                    self.run_update_net(net_in, ctx, corr, None, ii, jj, kk, topology)
+
+                if all_neural:
+                    self.net = net
+                else:
+                    self.net[:,neural] = net
+                weight = weight.float()
+                target = coords[...,self.P//2,self.P//2] + delta.float()
+                confidence = weight[0].mean(dim=-1)
+                delta_norm = delta[0].float().norm(dim=-1)
+
+                if all_neural:
+                    self.active_target = target.detach().float()
+                    self.active_weight = weight.detach().float()
+                    self.active_delta = delta.detach().float()
+                    self.active_confidence = confidence.detach().float()
+                    self.active_delta_norm = delta_norm.detach().float()
+                else:
+                    self.active_target[:,neural] = target.detach().float()
+                    self.active_weight[:,neural] = weight.detach().float()
+                    self.active_delta[:,neural] = delta.detach().float()
+                    self.active_confidence[neural] = confidence.detach().float()
+                    self.active_delta_norm[neural] = delta_norm.detach().float()
+                self.update_active_budget(confidence, delta_norm)
+
+            to_marginalize = self.select_marginalized_factors(
+                self.active_confidence, self.active_delta_norm)
+            self.marginalize_factors(to_marginalize, self.active_target, self.active_weight)
+
+        if self.active_keepalive.numel() > 0:
+            self.active_keepalive = torch.clamp(self.active_keepalive - 1, min=0)
+
+        if self.marginalize_freeze_cooldown > 0:
+            self.marginalize_freeze_cooldown -= 1
+
+        # Decay frozen edge weights so stale targets fade out gracefully.
+        if self.marg_weight.numel() > 0:
+            decay = self.frozen_weight_decay()
+            self.marg_weight *= decay
+            self.prune_marginalized_factors()
 
         lmbda = torch.as_tensor([1e-4], device="cuda")
-        weight = weight.float()
-            
-            # [DEBUG]
-            # dij = (self.ii - self.jj).abs()
-            # k = (dij > 0) & (dij <= 4)
-            # print("BA weights mean", weight[0, k].mean().item())
-            # print("BA weights std", weight[0, k].std().item())
-            # print("BA weights max", weight[0, k].max().item())
-            # print("BA weights min", weight[0, k].min().item())
-            # [DEBUG]
-        target = coords[...,self.P//2,self.P//2] + delta.float()
+        self.validate_marginalized_factors()
+        ba_ii, ba_jj, ba_kk, ba_target, ba_weight = self.ba_factors()
 
         with Timer("BA", enabled=self.enable_timing):
             t0 = self.n - self.cfg.OPTIMIZATION_WINDOW if self.is_initialized else 1
             t0 = max(t0, 1)
 
-            try:
-                fastba.BA(self.poses, self.patches, self.intrinsics, 
-                    target, weight, lmbda, self.ii, self.jj, self.kk, t0, self.n, 2)
-            except:
-                print("Warning BA failed...")
+            if len(ba_ii) > 0:
+                try:
+                    fastba.BA(self.poses, self.patches, self.intrinsics,
+                        ba_target, ba_weight, lmbda, ba_ii, ba_jj, ba_kk, t0, self.n,
+                        getattr(self.cfg, "BA_ITERATIONS", 2))
+                except:
+                    print("Warning BA failed...")
             
-            points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
-            points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
-            self.points_[:len(points)] = points[:]
+            if self.maintain_auxiliary_geometry:
+                points = pops.point_cloud(SE3(self.poses), self.patches[:, :self.m], self.intrinsics, self.ix[:self.m])
+                points = (points[...,1,1,:3] / points[...,1,1,3:]).reshape(-1, 3)
+                self.points_[:len(points)] = points[:]
 
     def flow_viz_step(self):
         # [DEBUG]
@@ -363,21 +1169,37 @@ class DEVO:
             torch.arange(0, self.m, device="cuda"),
             torch.arange(0, self.n, device="cuda"), indexing='ij')
 
+    def __thin_edges(self, ii, jj):
+        if not getattr(self.cfg, "EDGE_THINNING", False) or len(ii) == 0:
+            return ii, jj
+
+        stride = max(getattr(self.cfg, "EDGE_THIN_STRIDE", 1), 1)
+        if stride <= 1:
+            return ii, jj
+
+        dense_window = getattr(self.cfg, "EDGE_THIN_DENSE_WINDOW", 3)
+        patch_frame = self.ix[ii]
+        recent = (patch_frame - jj).abs() <= dense_window
+        keep = recent | ((ii % stride) == 0)
+        return ii[keep], jj[keep]
+
     def __edges_forw(self):
         r=self.cfg.PATCH_LIFETIME  # default: 13
         t0 = self.M * max((self.n - r), 0)
         t1 = self.M * max((self.n - 1), 0)
-        return flatmeshgrid(
+        ii, jj = flatmeshgrid(
             torch.arange(t0, t1, device="cuda"),
             torch.arange(self.n-1, self.n, device="cuda"), indexing='ij')
+        return self.__thin_edges(ii, jj)
 
     def __edges_back(self):
         r=self.cfg.PATCH_LIFETIME  # default: 13
         t0 = self.M * max((self.n - 1), 0)
         t1 = self.M * max((self.n - 0), 0)
-        return flatmeshgrid(
+        ii, jj = flatmeshgrid(
             torch.arange(t0, t1, device="cuda"),
             torch.arange(max(self.n-r, 0), self.n, device="cuda"), indexing='ij')
+        return self.__thin_edges(ii, jj)
 
     def __call__(self, tstamp, image, intrinsics, scale=1.0):
         """ track new frame """
@@ -472,15 +1294,23 @@ class DEVO:
         # plt.show()
 
         # TODO patches with depth is available (val)
-        with autocast(enabled=self.cfg.MIXED_PRECISION):
-            fmap, gmap, imap, patches, _, clr = \
-                self.network.patchify(image,
-                    patches_per_image=self.cfg.PATCHES_PER_FRAME, 
-                    return_color=True,
+        with torch.inference_mode():
+            with autocast(enabled=self.cfg.MIXED_PRECISION):
+                patchify_out = self.network.patchify(
+                    image,
+                    patches_per_image=self.cfg.PATCHES_PER_FRAME,
+                    return_color=self.maintain_auxiliary_geometry,
                     scorer_eval_mode=self.cfg.SCORER_EVAL_MODE,
                     scorer_eval_use_grid=self.cfg.SCORER_EVAL_USE_GRID)
 
-        self.patches_gt_[self.n] = patches.clone()
+                if self.maintain_auxiliary_geometry:
+                    fmap, gmap, imap, patches, _, clr = patchify_out
+                else:
+                    fmap, gmap, imap, patches, _ = patchify_out
+                    clr = None
+
+        if self.maintain_auxiliary_geometry:
+            self.patches_gt_[self.n] = patches.clone()
 
         ### update state attributes ###
         self.tlist.append(tstamp)
@@ -488,12 +1318,13 @@ class DEVO:
         self.intrinsics_[self.n] = intrinsics / self.RES
         
         # color info for visualization
-        if not self.evs:
-            clr = (clr[0,:,[2,1,0]] + 0.5) * (255.0 / 2)
-            self.colors_[self.n] = clr.to(torch.uint8)
-        else:
-            clr = (clr[0,:,[0,0,0]] + 0.5) * (255.0 / 2)
-            self.colors_[self.n] = clr.to(torch.uint8)
+        if self.maintain_auxiliary_geometry:
+            if not self.evs:
+                clr = (clr[0,:,[2,1,0]] + 0.5) * (255.0 / 2)
+                self.colors_[self.n] = clr.to(torch.uint8)
+            else:
+                clr = (clr[0,:,[0,0,0]] + 0.5) * (255.0 / 2)
+                self.colors_[self.n] = clr.to(torch.uint8)
             
 
         self.index_[self.n + 1] = self.n + 1

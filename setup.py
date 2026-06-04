@@ -23,6 +23,12 @@ setup(
                 'cxx':  ['-O3'], 
                 'nvcc': ['-O3'],
             }),
+        CUDAExtension('cuda_softagg',
+            sources=['devo/fastagg/softagg.cpp', 'devo/fastagg/softagg_kernel.cu'],
+            extra_compile_args={
+                'cxx':  ['-O3'],
+                'nvcc': ['-O3'],
+            }),
         CUDAExtension('lietorch_backends', 
             include_dirs=[
                 osp.join(ROOT, 'devo/lietorch/include'), 
@@ -36,4 +42,3 @@ setup(
     cmdclass={
         'build_ext': BuildExtension
     })
-
