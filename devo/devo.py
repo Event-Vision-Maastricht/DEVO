@@ -243,18 +243,6 @@ class DEVO:
         ix, jx = self.temporal_neighbors(kk, jj)
         kk_unique, kk_group = torch.unique(kk, return_inverse=True)
         ij_unique, ij_group = torch.unique(ii * 12345 + jj, return_inverse=True)
-        kk_order = torch.argsort(kk_group)
-        ij_order = torch.argsort(ij_group)
-        kk_counts = torch.bincount(kk_group, minlength=kk_unique.shape[0])
-        ij_counts = torch.bincount(ij_group, minlength=ij_unique.shape[0])
-        kk_offsets = torch.cat([
-            torch.zeros(1, dtype=torch.long, device=kk.device),
-            torch.cumsum(kk_counts, dim=0)
-        ])
-        ij_offsets = torch.cat([
-            torch.zeros(1, dtype=torch.long, device=ij_group.device),
-            torch.cumsum(ij_counts, dim=0)
-        ])
         topology = {
             "ix": ix,
             "jx": jx,
@@ -262,11 +250,24 @@ class DEVO:
             "ij_group": ij_group,
             "kk_num_groups": kk_unique.shape[0],
             "ij_num_groups": ij_unique.shape[0],
-            "kk_order": kk_order,
-            "ij_order": ij_order,
-            "kk_offsets": kk_offsets,
-            "ij_offsets": ij_offsets,
         }
+
+        if getattr(self.cfg, "FUSED_SOFTAGG", False) and \
+                getattr(self.cfg, "FUSED_SOFTAGG_SEGMENTED", True):
+            kk_order = torch.argsort(kk_group)
+            ij_order = torch.argsort(ij_group)
+            kk_counts = torch.bincount(kk_group, minlength=kk_unique.shape[0])
+            ij_counts = torch.bincount(ij_group, minlength=ij_unique.shape[0])
+            topology["kk_order"] = kk_order
+            topology["ij_order"] = ij_order
+            topology["kk_offsets"] = torch.cat([
+                torch.zeros(1, dtype=torch.long, device=kk.device),
+                torch.cumsum(kk_counts, dim=0)
+            ])
+            topology["ij_offsets"] = torch.cat([
+                torch.zeros(1, dtype=torch.long, device=ij_group.device),
+                torch.cumsum(ij_counts, dim=0)
+            ])
 
         if key is not None:
             self.update_topology_cache[key] = topology
@@ -827,6 +828,11 @@ class DEVO:
         if not enforce_budget or max_active_edges <= 0 or len(self.ii) <= max_active_edges:
             return converged
 
+        if getattr(self.cfg, "MARGINALIZE_QUOTA_ACTIVE_SET", False) and force_budget:
+            return self.select_quota_marginalized_factors(
+                candidates, protected, fresh, confidence, delta_norm, patch_frame,
+                max_active_edges, force_delta_thresh)
+
         num_to_freeze = len(self.ii) - max_active_edges
         if force_budget:
             freeze_pool = candidates & (delta_norm <= force_delta_thresh) & (~protected)
@@ -849,6 +855,50 @@ class DEVO:
         to_freeze = torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
         to_freeze[freeze_idx] = True
         return to_freeze
+
+    def select_quota_marginalized_factors(
+            self, candidates, protected, fresh, confidence, delta_norm,
+            patch_frame, max_active_edges, force_delta_thresh):
+        eligible_freeze = candidates & (delta_norm <= force_delta_thresh)
+        if eligible_freeze.sum().item() == 0:
+            return torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
+
+        mandatory_keep = (~eligible_freeze) | fresh
+        keep_slots = max_active_edges - mandatory_keep.sum().item()
+        if keep_slots <= 0:
+            return eligible_freeze
+
+        keep_pool = eligible_freeze
+        keep_slots = min(keep_slots, keep_pool.sum().item())
+        if keep_slots <= 0:
+            return eligible_freeze
+
+        delta = torch.where(
+            torch.isfinite(delta_norm),
+            delta_norm,
+            torch.full_like(delta_norm, force_delta_thresh))
+        low_conf = 1.0 - confidence.clamp(0.0, 1.0)
+        recency = (patch_frame.float() - patch_frame.float().min()).clamp(min=0.0)
+        baseline = (self.ii - self.jj).abs().float()
+        coverage_stride = getattr(self.cfg, "MARGINALIZE_KEEP_COVERAGE_STRIDE", 0)
+        if coverage_stride > 1:
+            coverage_anchor = ((self.kk % self.M) % coverage_stride == 0).float()
+        else:
+            coverage_anchor = torch.zeros_like(delta)
+
+        keep_score = \
+            getattr(self.cfg, "MARGINALIZE_KEEP_DELTA_WEIGHT", 2.0) * delta + \
+            getattr(self.cfg, "MARGINALIZE_KEEP_LOWCONF_WEIGHT", 1.0) * low_conf + \
+            getattr(self.cfg, "MARGINALIZE_KEEP_RECENCY_WEIGHT", 0.05) * recency + \
+            getattr(self.cfg, "MARGINALIZE_KEEP_BASELINE_WEIGHT", 0.20) * baseline + \
+            getattr(self.cfg, "MARGINALIZE_KEEP_COVERAGE_WEIGHT", 0.75) * coverage_anchor + \
+            getattr(self.cfg, "MARGINALIZE_KEEP_PROTECTED_WEIGHT", 3.0) * protected.float()
+        keep_score = keep_score.masked_fill(~keep_pool, -torch.inf)
+        _, keep_idx = torch.topk(keep_score, k=keep_slots)
+
+        keep = mandatory_keep.clone()
+        keep[keep_idx] = True
+        return eligible_freeze & (~keep)
 
     def marginalize_cached_factors(self):
         to_marginalize = self.select_marginalized_factors(
