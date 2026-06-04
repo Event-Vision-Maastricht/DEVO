@@ -23,7 +23,6 @@ class DEVO:
     def __init__(self, cfg, network, evs=False, ht=480, wd=640, viz=False, viz_flow=False, dim_inet=384, dim_fnet=128, dim=32):
         self.cfg = cfg
         self.evs = evs
-        self.configure_torch_runtime()
 
         self.dim_inet = dim_inet
         self.dim_fnet = dim_fnet
@@ -110,8 +109,6 @@ class DEVO:
         self.neural_edge_budget = getattr(self.cfg, "WARM_BASE_NEURAL_EDGES", 0)
         self.graph_version = 0
         self.update_topology_cache = {}
-        self.active_order_version = -1
-        self.active_edges_ordered = False
         
         # initialize poses to identity matrix
         self.poses_[:,6] = 1.0
@@ -122,17 +119,6 @@ class DEVO:
         self.viewer = None
         if viz:
             self.start_viewer()
-
-    def configure_torch_runtime(self):
-        if getattr(self.cfg, "CUDNN_BENCHMARK", False):
-            torch.backends.cudnn.benchmark = True
-
-        if getattr(self.cfg, "ALLOW_TF32", False):
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            if hasattr(torch, "set_float32_matmul_precision"):
-                torch.set_float32_matmul_precision(
-                    getattr(self.cfg, "FLOAT32_MATMUL_PRECISION", "high"))
 
     def load_weights(self, network):
         # load network from checkpoint file
@@ -206,7 +192,6 @@ class DEVO:
     def bump_graph_version(self):
         self.graph_version += 1
         self.update_topology_cache = {}
-        self.active_edges_ordered = False
 
     def update_topology(self, ii, jj, kk, cacheable=False):
         if not getattr(self.cfg, "UPDATE_TOPOLOGY_CACHE", False):
@@ -219,14 +204,8 @@ class DEVO:
             if cached is not None:
                 return cached
 
-        ordered = cacheable and self.active_edges_ordered and \
-            ii.data_ptr() == self.ii.data_ptr() and \
-            jj.data_ptr() == self.jj.data_ptr() and \
-            kk.data_ptr() == self.kk.data_ptr()
-
-        ix, jx = self.temporal_neighbors(kk, jj, ordered=ordered)
-        kk_group = self.ordered_group_inverse(kk) if ordered else \
-            torch.unique(kk, return_inverse=True)[1]
+        ix, jx = self.temporal_neighbors(kk, jj)
+        _, kk_group = torch.unique(kk, return_inverse=True)
         _, ij_group = torch.unique(ii * 12345 + jj, return_inverse=True)
         topology = {
             "ix": ix,
@@ -240,21 +219,11 @@ class DEVO:
 
         return topology
 
-    def temporal_neighbors(self, kk, jj, ordered=False):
+    def temporal_neighbors(self, kk, jj):
         if not getattr(self.cfg, "UPDATE_GPU_TOPOLOGY", True) or len(kk) == 0:
             return fastba.neighbors(kk, jj)
 
         try:
-            if ordered:
-                ix = torch.full_like(kk, -1)
-                jx = torch.full_like(kk, -1)
-                if len(kk) > 1:
-                    same_prev = kk[1:] == kk[:-1]
-                    ids = torch.arange(len(kk), dtype=kk.dtype, device=kk.device)
-                    ix[1:] = torch.where(same_prev, ids[:-1], ix[1:])
-                    jx[:-1] = torch.where(same_prev, ids[1:], jx[:-1])
-                return ix, jx
-
             key_stride = max(getattr(self.cfg, "BUFFER_SIZE", self.N), self.N) + 1
             edge_stride = len(kk) + 1
             edge_order = torch.arange(len(kk), dtype=kk.dtype, device=kk.device)
@@ -276,18 +245,6 @@ class DEVO:
             return ix, jx
         except TypeError:
             return fastba.neighbors(kk, jj)
-
-    def ordered_group_inverse(self, keys):
-        if len(keys) == 0:
-            return keys
-
-        group = torch.zeros_like(keys)
-        if len(keys) > 1:
-            starts = torch.ones_like(keys)
-            starts[0] = 0
-            starts[1:] = (keys[1:] != keys[:-1]).long()
-            group = torch.cumsum(starts, dim=0)
-        return group
 
     def run_update_net(self, net, ctx, corr, flow, ii, jj, kk, topology=None):
         try:
@@ -431,12 +388,11 @@ class DEVO:
         ii, jj = indicies if indicies is not None else (self.kk, self.jj)
         ii1 = ii % (self.M * self.mem)
         jj1 = jj % (self.mem)
-        fused_corr = getattr(self.cfg, "FUSED_CORR_INTERP", False)
-        corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3, fused=fused_corr)
+        corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3)
         if getattr(self.cfg, "CORR_SINGLE_LEVEL", False):
             corr2 = torch.zeros_like(corr1)
         else:
-            corr2 = altcorr.corr(self.gmap, self.pyramid[1], coords / 4, ii1, jj1, 3, fused=fused_corr)
+            corr2 = altcorr.corr(self.gmap, self.pyramid[1], coords / 4, ii1, jj1, 3)
         return torch.stack([corr1, corr2], -1).view(1, len(ii), -1)
 
     def reproject(self, indicies=None):
@@ -501,36 +457,6 @@ class DEVO:
         self.remove_factors(m_active)
         if m_marg is not None:
             self.remove_marginalized_factors(m_marg)
-
-    def order_active_factors(self):
-        if not getattr(self.cfg, "EDGE_ORDERING_ENABLED", False) or len(self.ii) <= 1:
-            return
-        if self.active_order_version == self.graph_version:
-            return
-
-        stride = max(getattr(self.cfg, "BUFFER_SIZE", self.N), self.N) + 1
-        edge_stride = len(self.kk) + 1
-        original = torch.arange(len(self.kk), dtype=self.kk.dtype, device=self.kk.device)
-        order = torch.argsort((self.kk * stride + self.jj) * edge_stride + original)
-
-        if torch.equal(order, original):
-            self.active_order_version = self.graph_version
-            self.active_edges_ordered = True
-            return
-
-        self.ii = self.ii[order]
-        self.jj = self.jj[order]
-        self.kk = self.kk[order]
-        self.net = self.net[:,order]
-        self.active_target = self.active_target[:,order]
-        self.active_weight = self.active_weight[:,order]
-        self.active_delta = self.active_delta[:,order]
-        self.active_confidence = self.active_confidence[order]
-        self.active_delta_norm = self.active_delta_norm[order]
-        self.active_keepalive = self.active_keepalive[order]
-        self.bump_graph_version()
-        self.active_order_version = self.graph_version
-        self.active_edges_ordered = True
 
     def marginalization_enabled(self):
         return getattr(self.cfg, "ACTIVE_EDGE_MARGINALIZATION", False)
@@ -651,6 +577,7 @@ class DEVO:
         newest_core = max(self.n - core_window, 0)
         core = (self.ii >= newest_core) | (self.jj >= newest_core)
         fresh = torch.isinf(self.active_delta_norm) | (self.active_weight[0].mean(dim=-1) <= 0)
+
         stable_conf = getattr(self.cfg, "WARM_STABLE_CONF_THRESH", 0.6)
         stable_delta = getattr(self.cfg, "WARM_STABLE_DELTA_THRESH", 0.35)
         skip_pool = (~core) & (~fresh) & \
@@ -970,7 +897,6 @@ class DEVO:
     def update(self):
         self.marginalize_update_count += 1
         self.marginalize_cached_factors()
-        self.order_active_factors()
         self.print_marginalization_stats()
 
         if len(self.ii) > 0:

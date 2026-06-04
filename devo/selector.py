@@ -239,7 +239,7 @@ class PatchSelector():
                 unique = torch.cat([unique, repeats])
             rows.append(unique[:patches_per_image])
         return torch.stack(rows, dim=0)
-
+    
     def _nms(self, scores, patches_per_image):
         """ pooled nms sampling
         

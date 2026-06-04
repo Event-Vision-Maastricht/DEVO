@@ -80,85 +80,6 @@ __global__ void patchify_backward_kernel(int R,
 }
 
 template <typename scalar_t>
-__device__ scalar_t corr_lookup(
-    const torch::PackedTensorAccessor32<scalar_t,5,torch::RestrictPtrTraits>& fmap1,
-    const torch::PackedTensorAccessor32<scalar_t,5,torch::RestrictPtrTraits>& fmap2,
-    int b, int ix, int jx, int i0, int j0, int i1, int j1,
-    int C, int H2, int W2)
-{
-  scalar_t s = 0;
-  if (within_bounds(i1, j1, H2, W2)) {
-    #pragma unroll 8
-    for (int i=0; i<C; i+=8) {
-      scalar_t f1[8]; for (int j=0; j<8; j++) f1[j] = fmap1[b][ix][i+j][i0][j0];
-      scalar_t f2[8]; for (int j=0; j<8; j++) f2[j] = fmap2[b][jx][i+j][i1][j1];
-
-      #pragma unroll
-      for (int j=0; j<8; j++) s += f1[j] * f2[j];
-    }
-  }
-  return s;
-}
-
-template <typename scalar_t>
-__global__ void corr_forward_fused_kernel(int R,
-    const torch::PackedTensorAccessor32<scalar_t,5,torch::RestrictPtrTraits> fmap1,
-    const torch::PackedTensorAccessor32<scalar_t,5,torch::RestrictPtrTraits> fmap2,
-    const torch::PackedTensorAccessor32<float,5,torch::RestrictPtrTraits> coords,
-    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> us,
-    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> vs,
-    torch::PackedTensorAccessor32<scalar_t,6,torch::RestrictPtrTraits> out)
-{
-  const int D = 2*R + 1;
-
-  const int B = coords.size(0);
-  const int M = coords.size(1);
-  const int H = coords.size(3);
-  const int W = coords.size(4);
-
-  const int C = fmap1.size(2);
-  const int H2 = fmap2.size(3);
-  const int W2 = fmap2.size(4);
-
-  int n = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (n < B * M * H * W * D * D) {
-    const int jj = n % D; n /= D;
-    const int ii = n % D; n /= D;
-    const int j0 = n % W; n /= W;
-    const int i0 = n % H; n /= H;
-    const int  m = n % M; n /= M;
-
-    const int ix = us[m];
-    const int jx = vs[m];
-
-    const float x = coords[n][m][0][i0][j0];
-    const float y = coords[n][m][1][i0][j0];
-    const float dx = x - floor(x);
-    const float dy = y - floor(y);
-
-    const int i1 = static_cast<int>(floor(y)) + (ii - R);
-    const int j1 = static_cast<int>(floor(x)) + (jj - R);
-
-    const scalar_t s00 = corr_lookup(fmap1, fmap2, n, ix, jx, i0, j0, i1,   j1,   C, H2, W2);
-    const scalar_t s01 = corr_lookup(fmap1, fmap2, n, ix, jx, i0, j0, i1,   j1+1, C, H2, W2);
-    const scalar_t s10 = corr_lookup(fmap1, fmap2, n, ix, jx, i0, j0, i1+1, j1,   C, H2, W2);
-    const scalar_t s11 = corr_lookup(fmap1, fmap2, n, ix, jx, i0, j0, i1+1, j1+1, C, H2, W2);
-
-    const float w00 = (1.0f - dx) * (1.0f - dy);
-    const float w01 = dx * (1.0f - dy);
-    const float w10 = (1.0f - dx) * dy;
-    const float w11 = dx * dy;
-
-    out[n][m][jj][ii][i0][j0] =
-      static_cast<scalar_t>(w00 * static_cast<float>(s00) +
-                            w01 * static_cast<float>(s01) +
-                            w10 * static_cast<float>(s10) +
-                            w11 * static_cast<float>(s11));
-  }
-}
-
-template <typename scalar_t>
 __global__ void corr_forward_kernel(int R,
     const torch::PackedTensorAccessor32<scalar_t,5,torch::RestrictPtrTraits> fmap1,
     const torch::PackedTensorAccessor32<scalar_t,5,torch::RestrictPtrTraits> fmap2,
@@ -309,38 +230,6 @@ std::vector<torch::Tensor> corr_cuda_forward(
   out +=     (dx) *     (dy) * corr.index({Slice(), Slice(), Slice(1, D-0), Slice(1, D-0)});
 
   return { out.permute({0,1,3,2,4,5}) };
-}
-
-
-std::vector<torch::Tensor> corr_cuda_forward_fused(
-  torch::Tensor fmap1,
-  torch::Tensor fmap2,
-  torch::Tensor coords,
-  torch::Tensor ii,
-  torch::Tensor jj,
-  int radius)
-{
-  const int B = coords.size(0);
-  const int M = coords.size(1);
-
-  const int H = coords.size(3);
-  const int W = coords.size(4);
-  const int D = 2 * radius + 1;
-
-  auto opts = fmap1.options();
-  auto corr = torch::empty({B, M, D, D, H, W}, opts);
-
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(fmap1.type(), "corr_forward_fused_kernel", ([&] {
-      corr_forward_fused_kernel<scalar_t><<<BLOCKS(B * M * H * W * D * D), THREADS>>>(radius,
-        fmap1.packed_accessor32<scalar_t,5,torch::RestrictPtrTraits>(),
-        fmap2.packed_accessor32<scalar_t,5,torch::RestrictPtrTraits>(),
-        coords.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
-        ii.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
-        jj.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
-        corr.packed_accessor32<scalar_t,6,torch::RestrictPtrTraits>());
-  }));
-
-  return { corr };
 }
 
 
