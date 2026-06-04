@@ -84,11 +84,10 @@ __global__ void softagg_sum_kernel(
   atomicAdd(&accum[out_idx], scalar_to_float(values[idx]) * w);
 }
 
-template <typename scalar_t>
 __global__ void softagg_out_kernel(
     const float* __restrict__ denom,
     const float* __restrict__ accum,
-    scalar_t* __restrict__ out,
+    float* __restrict__ out,
     int64_t total) {
   int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total) {
@@ -97,7 +96,7 @@ __global__ void softagg_out_kernel(
 
   float d = denom[idx];
   float y = d > 0.0f ? accum[idx] / d : 0.0f;
-  out[idx] = static_cast<scalar_t>(y);
+  out[idx] = y;
 }
 
 }  // namespace
@@ -109,9 +108,8 @@ torch::Tensor softagg_forward_cuda(
     int64_t num_groups) {
   const auto edges = values.size(0);
   const auto channels = values.size(1);
-  auto out = torch::empty({num_groups, channels}, values.options());
-
   auto float_opts = values.options().dtype(torch::kFloat32);
+  auto out = torch::empty({num_groups, channels}, float_opts);
   auto maxes = torch::full(
       {num_groups, channels}, -std::numeric_limits<float>::infinity(), float_opts);
   auto denom = torch::zeros({num_groups, channels}, float_opts);
@@ -143,12 +141,13 @@ torch::Tensor softagg_forward_cuda(
         channels,
         num_groups);
 
-    softagg_out_kernel<scalar_t><<<blocks_out, threads, 0, stream>>>(
-        denom.data_ptr<float>(),
-        accum.data_ptr<float>(),
-        out.data_ptr<scalar_t>(),
-        num_groups * channels);
   });
+
+  softagg_out_kernel<<<blocks_out, threads, 0, stream>>>(
+      denom.data_ptr<float>(),
+      accum.data_ptr<float>(),
+      out.data_ptr<float>(),
+      num_groups * channels);
 
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;

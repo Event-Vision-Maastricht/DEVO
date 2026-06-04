@@ -62,16 +62,11 @@ class FusedSoftAgg(nn.Module):
         self.f = agg.f
         self.g = agg.g
         self.h = agg.h
+        self.enabled = cuda_softagg is not None
 
     def forward(self, x, ix, jx=None, num_groups=None):
-        if cuda_softagg is None or x.shape[0] != 1 or not x.is_cuda:
-            if jx is None:
-                _, jx = torch.unique(ix, return_inverse=True)
-            w = torch_scatter.scatter_softmax(self.g(x), jx, dim=1)
-            y = torch_scatter.scatter_sum(self.f(x) * w, jx, dim=1)
-            if self.expand:
-                return self.h(y)[:,jx]
-            return self.h(y)
+        if not self.enabled or x.shape[0] != 1 or not x.is_cuda:
+            return self.forward_reference(x, ix, jx)
 
         if jx is None:
             _, jx = torch.unique(ix, return_inverse=True)
@@ -92,6 +87,39 @@ class FusedSoftAgg(nn.Module):
             return self.h(y)[:,jx]
 
         return self.h(y)
+
+    def forward_reference(self, x, ix, jx=None):
+        if jx is None:
+            _, jx = torch.unique(ix, return_inverse=True)
+        w = torch_scatter.scatter_softmax(self.g(x), jx, dim=1)
+        y = torch_scatter.scatter_sum(self.f(x) * w, jx, dim=1)
+        if self.expand:
+            return self.h(y)[:,jx]
+        return self.h(y)
+
+    def validate_kernel(self, atol=1e-3, rtol=1e-3):
+        if cuda_softagg is None:
+            self.enabled = False
+            return False
+
+        device = next(self.parameters()).device
+        dtype = next(self.parameters()).dtype
+        edges = 257
+        num_groups = 73
+
+        x = torch.randn(1, edges, self.dim, device=device, dtype=dtype)
+        jx = torch.arange(edges, device=device, dtype=torch.long) % num_groups
+        perm = torch.randperm(edges, device=device)
+        jx = jx[perm].contiguous()
+        ix = jx
+
+        with torch.no_grad():
+            ref = self.forward_reference(x, ix, jx).float()
+            fused = self.forward(x, ix, jx, num_groups).float()
+            ok = torch.allclose(ref, fused, atol=atol, rtol=rtol)
+
+        self.enabled = bool(ok)
+        return self.enabled
 
 class SoftAggBasic(nn.Module):
     def __init__(self, dim=512, expand=True):

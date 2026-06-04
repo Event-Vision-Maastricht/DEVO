@@ -179,8 +179,19 @@ class DEVO:
 
     def configure_update_aggregation(self):
         if getattr(self.cfg, "FUSED_SOFTAGG", False):
-            self.network.update.agg_kk = FusedSoftAgg(self.network.update.agg_kk)
-            self.network.update.agg_ij = FusedSoftAgg(self.network.update.agg_ij)
+            agg_kk = FusedSoftAgg(self.network.update.agg_kk)
+            agg_ij = FusedSoftAgg(self.network.update.agg_ij)
+
+            if getattr(self.cfg, "FUSED_SOFTAGG_VALIDATE", True):
+                atol = getattr(self.cfg, "FUSED_SOFTAGG_ATOL", 1e-3)
+                rtol = getattr(self.cfg, "FUSED_SOFTAGG_RTOL", 1e-3)
+                ok_kk = agg_kk.validate_kernel(atol=atol, rtol=rtol)
+                ok_ij = agg_ij.validate_kernel(atol=atol, rtol=rtol)
+                if not (ok_kk and ok_ij):
+                    print("Warning: fused SoftAgg validation failed; using torch_scatter fallback")
+
+            self.network.update.agg_kk = agg_kk
+            self.network.update.agg_ij = agg_ij
 
         if not getattr(self.cfg, "SCALAR_SOFTAGG", False):
             return
