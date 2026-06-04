@@ -179,8 +179,9 @@ class DEVO:
 
     def configure_update_aggregation(self):
         if getattr(self.cfg, "FUSED_SOFTAGG", False):
-            agg_kk = FusedSoftAgg(self.network.update.agg_kk)
-            agg_ij = FusedSoftAgg(self.network.update.agg_ij)
+            segmented = getattr(self.cfg, "FUSED_SOFTAGG_SEGMENTED", True)
+            agg_kk = FusedSoftAgg(self.network.update.agg_kk, segmented=segmented)
+            agg_ij = FusedSoftAgg(self.network.update.agg_ij, segmented=segmented)
 
             if getattr(self.cfg, "FUSED_SOFTAGG_VALIDATE", True):
                 atol = getattr(self.cfg, "FUSED_SOFTAGG_ATOL", 1e-3)
@@ -242,6 +243,18 @@ class DEVO:
         ix, jx = self.temporal_neighbors(kk, jj)
         kk_unique, kk_group = torch.unique(kk, return_inverse=True)
         ij_unique, ij_group = torch.unique(ii * 12345 + jj, return_inverse=True)
+        kk_order = torch.argsort(kk_group)
+        ij_order = torch.argsort(ij_group)
+        kk_counts = torch.bincount(kk_group, minlength=kk_unique.shape[0])
+        ij_counts = torch.bincount(ij_group, minlength=ij_unique.shape[0])
+        kk_offsets = torch.cat([
+            torch.zeros(1, dtype=torch.long, device=kk.device),
+            torch.cumsum(kk_counts, dim=0)
+        ])
+        ij_offsets = torch.cat([
+            torch.zeros(1, dtype=torch.long, device=ij_group.device),
+            torch.cumsum(ij_counts, dim=0)
+        ])
         topology = {
             "ix": ix,
             "jx": jx,
@@ -249,6 +262,10 @@ class DEVO:
             "ij_group": ij_group,
             "kk_num_groups": kk_unique.shape[0],
             "ij_num_groups": ij_unique.shape[0],
+            "kk_order": kk_order,
+            "ij_order": ij_order,
+            "kk_offsets": kk_offsets,
+            "ij_offsets": ij_offsets,
         }
 
         if key is not None:
@@ -812,7 +829,7 @@ class DEVO:
 
         num_to_freeze = len(self.ii) - max_active_edges
         if force_budget:
-            freeze_pool = candidates & (delta_norm <= force_delta_thresh)
+            freeze_pool = candidates & (delta_norm <= force_delta_thresh) & (~protected)
         else:
             freeze_pool = converged & (~protected)
 
@@ -826,7 +843,6 @@ class DEVO:
         if backbone_window > 0 and backbone_penalty > 0:
             temporal_backbone = (self.ii - self.jj).abs() <= backbone_window
             score = score - backbone_penalty * temporal_backbone.float()
-        score = score - 10.0 * protected.float()
         score = score.masked_fill(~freeze_pool, -torch.inf)
         _, freeze_idx = torch.topk(score, k=num_to_freeze)
 

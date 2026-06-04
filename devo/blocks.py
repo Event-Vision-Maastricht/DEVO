@@ -42,7 +42,7 @@ class SoftAgg(nn.Module):
         self.g = nn.Linear(self.dim, self.dim)
         self.h = nn.Linear(self.dim, self.dim)
 
-    def forward(self, x, ix, jx=None, num_groups=None):
+    def forward(self, x, ix, jx=None, num_groups=None, order=None, offsets=None):
         if jx is None:
             _, jx = torch.unique(ix, return_inverse=True)
 
@@ -55,7 +55,7 @@ class SoftAgg(nn.Module):
         return self.h(y)
 
 class FusedSoftAgg(nn.Module):
-    def __init__(self, agg):
+    def __init__(self, agg, segmented=True):
         super(FusedSoftAgg, self).__init__()
         self.dim = agg.dim
         self.expand = agg.expand
@@ -63,8 +63,10 @@ class FusedSoftAgg(nn.Module):
         self.g = agg.g
         self.h = agg.h
         self.enabled = cuda_softagg is not None
+        self.segmented = segmented and cuda_softagg is not None and hasattr(cuda_softagg, "forward_sorted")
+        self.ordered = segmented and cuda_softagg is not None and hasattr(cuda_softagg, "forward_ordered")
 
-    def forward(self, x, ix, jx=None, num_groups=None):
+    def forward(self, x, ix, jx=None, num_groups=None, order=None, offsets=None):
         if not self.enabled or x.shape[0] != 1 or not x.is_cuda:
             return self.forward_reference(x, ix, jx)
 
@@ -77,11 +79,33 @@ class FusedSoftAgg(nn.Module):
             # pass an exact group count and avoid empty-group work.
             num_groups = x.shape[1]
 
-        y = cuda_softagg.forward(
-            self.f(x)[0].contiguous(),
-            self.g(x)[0].contiguous(),
-            jx.contiguous(),
-            num_groups).unsqueeze(0)
+        values = self.f(x)[0].contiguous()
+        logits = self.g(x)[0].contiguous()
+
+        if self.ordered and order is not None and offsets is not None:
+            y = cuda_softagg.forward_ordered(
+                values,
+                logits,
+                order.contiguous(),
+                offsets.contiguous()).unsqueeze(0)
+        elif self.segmented:
+            if order is None or offsets is None:
+                order = torch.argsort(jx)
+                counts = torch.bincount(jx, minlength=num_groups)
+                offsets = torch.cat([
+                    torch.zeros(1, dtype=torch.long, device=x.device),
+                    torch.cumsum(counts, dim=0)
+                ])
+            y = cuda_softagg.forward_sorted(
+                values[order].contiguous(),
+                logits[order].contiguous(),
+                offsets).unsqueeze(0)
+        else:
+            y = cuda_softagg.forward(
+                values,
+                logits,
+                jx.contiguous(),
+                num_groups).unsqueeze(0)
 
         if self.expand:
             return self.h(y)[:,jx]
@@ -130,7 +154,7 @@ class SoftAggBasic(nn.Module):
         self.g = nn.Linear(self.dim,        1)
         self.h = nn.Linear(self.dim, self.dim)
 
-    def forward(self, x, ix, jx=None, num_groups=None):
+    def forward(self, x, ix, jx=None, num_groups=None, order=None, offsets=None):
         if jx is None:
             _, jx = torch.unique(ix, return_inverse=True)
 
