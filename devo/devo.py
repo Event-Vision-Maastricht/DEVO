@@ -98,6 +98,7 @@ class DEVO:
         self.active_confidence = torch.as_tensor([], dtype=torch.float, device="cuda")
         self.active_delta_norm = torch.as_tensor([], dtype=torch.float, device="cuda")
         self.active_keepalive = torch.as_tensor([], dtype=torch.long, device="cuda")
+        self.active_warm_age = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_ii = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_jj = torch.as_tensor([], dtype=torch.long, device="cuda")
         self.marg_kk = torch.as_tensor([], dtype=torch.long, device="cuda")
@@ -179,9 +180,8 @@ class DEVO:
 
     def configure_update_aggregation(self):
         if getattr(self.cfg, "FUSED_SOFTAGG", False):
-            segmented = getattr(self.cfg, "FUSED_SOFTAGG_SEGMENTED", True)
-            agg_kk = FusedSoftAgg(self.network.update.agg_kk, segmented=segmented)
-            agg_ij = FusedSoftAgg(self.network.update.agg_ij, segmented=segmented)
+            agg_kk = FusedSoftAgg(self.network.update.agg_kk)
+            agg_ij = FusedSoftAgg(self.network.update.agg_ij)
 
             if getattr(self.cfg, "FUSED_SOFTAGG_VALIDATE", True):
                 atol = getattr(self.cfg, "FUSED_SOFTAGG_ATOL", 1e-3)
@@ -251,23 +251,6 @@ class DEVO:
             "kk_num_groups": kk_unique.shape[0],
             "ij_num_groups": ij_unique.shape[0],
         }
-
-        if getattr(self.cfg, "FUSED_SOFTAGG", False) and \
-                getattr(self.cfg, "FUSED_SOFTAGG_SEGMENTED", True):
-            kk_order = torch.argsort(kk_group)
-            ij_order = torch.argsort(ij_group)
-            kk_counts = torch.bincount(kk_group, minlength=kk_unique.shape[0])
-            ij_counts = torch.bincount(ij_group, minlength=ij_unique.shape[0])
-            topology["kk_order"] = kk_order
-            topology["ij_order"] = ij_order
-            topology["kk_offsets"] = torch.cat([
-                torch.zeros(1, dtype=torch.long, device=kk.device),
-                torch.cumsum(kk_counts, dim=0)
-            ])
-            topology["ij_offsets"] = torch.cat([
-                torch.zeros(1, dtype=torch.long, device=ij_group.device),
-                torch.cumsum(ij_counts, dim=0)
-            ])
 
         if key is not None:
             self.update_topology_cache[key] = topology
@@ -535,6 +518,9 @@ class DEVO:
         ii, jj = indicies if indicies is not None else (self.kk, self.jj)
         ii1 = ii % (self.M * self.mem)
         jj1 = jj % (self.mem)
+        if getattr(self.cfg, "FUSED_CORR_PYRAMID", False) and not getattr(self.cfg, "CORR_SINGLE_LEVEL", False):
+            return altcorr.corr_pyramid(self.gmap, self.pyramid[0], self.pyramid[1], coords, coords / 4, ii1, jj1, 3)
+
         corr1 = altcorr.corr(self.gmap, self.pyramid[0], coords / 1, ii1, jj1, 3)
         if getattr(self.cfg, "CORR_SINGLE_LEVEL", False):
             corr2 = torch.zeros_like(corr1)
@@ -576,6 +562,9 @@ class DEVO:
         self.active_keepalive = torch.cat([
             self.active_keepalive,
             torch.zeros(len(ii), dtype=torch.long, device="cuda")])
+        self.active_warm_age = torch.cat([
+            self.active_warm_age,
+            torch.zeros(len(ii), dtype=torch.long, device="cuda")])
 
     def remove_factors(self, m):
         self.ii = self.ii[~m]
@@ -588,6 +577,7 @@ class DEVO:
         self.active_confidence = self.active_confidence[~m]
         self.active_delta_norm = self.active_delta_norm[~m]
         self.active_keepalive = self.active_keepalive[~m]
+        self.active_warm_age = self.active_warm_age[~m]
         if m.any():
             self.bump_graph_version()
 
@@ -655,6 +645,9 @@ class DEVO:
         self.active_keepalive = torch.cat([
             self.active_keepalive,
             torch.full((num,), keepalive, dtype=torch.long, device="cuda")])
+        self.active_warm_age = torch.cat([
+            self.active_warm_age,
+            torch.zeros(num, dtype=torch.long, device="cuda")])
         self.remove_marginalized_factors(m)
 
     def current_active_budget(self):
@@ -727,7 +720,11 @@ class DEVO:
 
         stable_conf = getattr(self.cfg, "WARM_STABLE_CONF_THRESH", 0.6)
         stable_delta = getattr(self.cfg, "WARM_STABLE_DELTA_THRESH", 0.35)
+        max_skip = getattr(self.cfg, "WARM_MAX_SKIP_FRAMES", 0)
+        refresh_due = (self.active_warm_age >= max_skip) if max_skip > 0 else \
+            torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
         skip_pool = (~core) & (~fresh) & \
+            (~refresh_due) & \
             (self.active_confidence >= stable_conf) & \
             (self.active_delta_norm <= stable_delta)
 
@@ -828,14 +825,9 @@ class DEVO:
         if not enforce_budget or max_active_edges <= 0 or len(self.ii) <= max_active_edges:
             return converged
 
-        if getattr(self.cfg, "MARGINALIZE_QUOTA_ACTIVE_SET", False) and force_budget:
-            return self.select_quota_marginalized_factors(
-                candidates, protected, fresh, confidence, delta_norm, patch_frame,
-                max_active_edges, force_delta_thresh)
-
         num_to_freeze = len(self.ii) - max_active_edges
         if force_budget:
-            freeze_pool = candidates & (delta_norm <= force_delta_thresh) & (~protected)
+            freeze_pool = candidates & (delta_norm <= force_delta_thresh)
         else:
             freeze_pool = converged & (~protected)
 
@@ -849,56 +841,13 @@ class DEVO:
         if backbone_window > 0 and backbone_penalty > 0:
             temporal_backbone = (self.ii - self.jj).abs() <= backbone_window
             score = score - backbone_penalty * temporal_backbone.float()
+        score = score - 10.0 * protected.float()
         score = score.masked_fill(~freeze_pool, -torch.inf)
         _, freeze_idx = torch.topk(score, k=num_to_freeze)
 
         to_freeze = torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
         to_freeze[freeze_idx] = True
         return to_freeze
-
-    def select_quota_marginalized_factors(
-            self, candidates, protected, fresh, confidence, delta_norm,
-            patch_frame, max_active_edges, force_delta_thresh):
-        eligible_freeze = candidates & (delta_norm <= force_delta_thresh)
-        if eligible_freeze.sum().item() == 0:
-            return torch.zeros(len(self.ii), dtype=torch.bool, device="cuda")
-
-        mandatory_keep = (~eligible_freeze) | fresh
-        keep_slots = max_active_edges - mandatory_keep.sum().item()
-        if keep_slots <= 0:
-            return eligible_freeze
-
-        keep_pool = eligible_freeze
-        keep_slots = min(keep_slots, keep_pool.sum().item())
-        if keep_slots <= 0:
-            return eligible_freeze
-
-        delta = torch.where(
-            torch.isfinite(delta_norm),
-            delta_norm,
-            torch.full_like(delta_norm, force_delta_thresh))
-        low_conf = 1.0 - confidence.clamp(0.0, 1.0)
-        recency = (patch_frame.float() - patch_frame.float().min()).clamp(min=0.0)
-        baseline = (self.ii - self.jj).abs().float()
-        coverage_stride = getattr(self.cfg, "MARGINALIZE_KEEP_COVERAGE_STRIDE", 0)
-        if coverage_stride > 1:
-            coverage_anchor = ((self.kk % self.M) % coverage_stride == 0).float()
-        else:
-            coverage_anchor = torch.zeros_like(delta)
-
-        keep_score = \
-            getattr(self.cfg, "MARGINALIZE_KEEP_DELTA_WEIGHT", 2.0) * delta + \
-            getattr(self.cfg, "MARGINALIZE_KEEP_LOWCONF_WEIGHT", 1.0) * low_conf + \
-            getattr(self.cfg, "MARGINALIZE_KEEP_RECENCY_WEIGHT", 0.05) * recency + \
-            getattr(self.cfg, "MARGINALIZE_KEEP_BASELINE_WEIGHT", 0.20) * baseline + \
-            getattr(self.cfg, "MARGINALIZE_KEEP_COVERAGE_WEIGHT", 0.75) * coverage_anchor + \
-            getattr(self.cfg, "MARGINALIZE_KEEP_PROTECTED_WEIGHT", 3.0) * protected.float()
-        keep_score = keep_score.masked_fill(~keep_pool, -torch.inf)
-        _, keep_idx = torch.topk(keep_score, k=keep_slots)
-
-        keep = mandatory_keep.clone()
-        keep[keep_idx] = True
-        return eligible_freeze & (~keep)
 
     def marginalize_cached_factors(self):
         to_marginalize = self.select_marginalized_factors(
@@ -1140,7 +1089,12 @@ class DEVO:
                 kk = self.kk if all_neural else self.kk[neural]
                 net_in = self.net if all_neural else self.net[:,neural]
                 with torch.inference_mode():
-                    coords = self.reproject(indicies=(ii, jj, kk))
+                    coords_all = None
+                    if all_neural or not getattr(self.cfg, "WARM_REFRESH_SKIPPED_TARGETS", True):
+                        coords = self.reproject(indicies=(ii, jj, kk))
+                    else:
+                        coords_all = self.reproject(indicies=(self.ii, self.jj, self.kk))
+                        coords = coords_all[:,neural]
 
                     with autocast(enabled=True):
 
@@ -1170,13 +1124,37 @@ class DEVO:
                     self.active_delta = delta.detach().float()
                     self.active_confidence = confidence.detach().float()
                     self.active_delta_norm = delta_norm.detach().float()
+                    if self.active_warm_age.numel() == len(self.ii):
+                        self.active_warm_age.zero_()
                 else:
                     self.active_target[:,neural] = target.detach().float()
                     self.active_weight[:,neural] = weight.detach().float()
                     self.active_delta[:,neural] = delta.detach().float()
                     self.active_confidence[neural] = confidence.detach().float()
                     self.active_delta_norm[neural] = delta_norm.detach().float()
-                self.update_active_budget(confidence, delta_norm)
+                    self.active_warm_age[neural] = 0
+                    skipped = ~neural
+                    if getattr(self.cfg, "WARM_REFRESH_SKIPPED_TARGETS", True):
+                        if skipped.any():
+                            skip_coords = coords_all[:,skipped] if coords_all is not None else \
+                                self.reproject(indicies=(self.ii[skipped], self.jj[skipped], self.kk[skipped]))
+                            skip_center = skip_coords[...,self.P//2,self.P//2]
+                            self.active_target[:,skipped] = (
+                                skip_center + self.active_delta[:,skipped]).detach().float()
+                            decay = getattr(self.cfg, "WARM_SKIPPED_WEIGHT_DECAY", 1.0)
+                            if decay < 1.0:
+                                self.active_weight[:,skipped] = (
+                                    self.active_weight[:,skipped] * decay).detach().float()
+                                self.active_confidence[skipped] = (
+                                    self.active_weight[0,skipped].mean(dim=-1)).detach().float()
+                    if skipped.any():
+                        self.active_warm_age[skipped] += 1
+
+                self.update_active_budget(self.active_confidence, self.active_delta_norm)
+                if getattr(self.cfg, "WARM_PRINT_STATS", False) and not all_neural:
+                    print(
+                        f"warm active={len(self.ii)} neural={neural.sum().item()} "
+                        f"skipped={(~neural).sum().item()} budget={self.neural_edge_budget}")
 
             to_marginalize = self.select_marginalized_factors(
                 self.active_confidence, self.active_delta_norm)

@@ -10,6 +10,16 @@ std::vector<torch::Tensor> corr_cuda_forward(
     torch::Tensor jj,
     int radius);
 
+std::vector<torch::Tensor> corr_pyramid_cuda_forward(
+    torch::Tensor fmap1,
+    torch::Tensor fmap2a,
+    torch::Tensor fmap2b,
+    torch::Tensor coords1,
+    torch::Tensor coords2,
+    torch::Tensor ii,
+    torch::Tensor jj,
+    int radius);
+
 std::vector<torch::Tensor> corr_cuda_backward(
   torch::Tensor fmap1,
   torch::Tensor fmap2,
@@ -34,6 +44,18 @@ std::vector<torch::Tensor> corr_forward(
   return corr_cuda_forward(fmap1, fmap2, coords, ii, jj, radius);
 }
 
+std::vector<torch::Tensor> corr_pyramid_forward(
+    torch::Tensor fmap1,
+    torch::Tensor fmap2a,
+    torch::Tensor fmap2b,
+    torch::Tensor coords1,
+    torch::Tensor coords2,
+    torch::Tensor ii,
+    torch::Tensor jj,
+    int radius) {
+  return corr_pyramid_cuda_forward(fmap1, fmap2a, fmap2b, coords1, coords2, ii, jj, radius);
+}
+
 std::vector<torch::Tensor> corr_backward(
     torch::Tensor fmap1,
     torch::Tensor fmap2,
@@ -56,6 +78,7 @@ std::vector<torch::Tensor> patchify_backward(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward", &corr_forward, "CORR forward");
+  m.def("forward_pyramid", &corr_pyramid_forward, "CORR two-level pyramid forward");
   m.def("backward", &corr_backward, "CORR backward");
 
   m.def("patchify_forward", &patchify_forward, "PATCHIFY forward");

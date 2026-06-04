@@ -135,6 +135,109 @@ __global__ void corr_forward_kernel(int R,
   }
 }
 
+template <typename scalar_t>
+__global__ void corr_pyramid_fused_kernel(int R,
+    const torch::PackedTensorAccessor32<scalar_t,5,torch::RestrictPtrTraits> fmap1,
+    const torch::PackedTensorAccessor32<scalar_t,5,torch::RestrictPtrTraits> fmap2a,
+    const torch::PackedTensorAccessor32<scalar_t,5,torch::RestrictPtrTraits> fmap2b,
+    const torch::PackedTensorAccessor32<float,5,torch::RestrictPtrTraits> coords1,
+    const torch::PackedTensorAccessor32<float,5,torch::RestrictPtrTraits> coords2,
+    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> us,
+    const torch::PackedTensorAccessor32<long,1,torch::RestrictPtrTraits> vs,
+    torch::PackedTensorAccessor32<scalar_t,7,torch::RestrictPtrTraits> packed)
+{
+  const int D = 2 * R + 2;
+  const int d = D - 1;
+
+  const int B = coords1.size(0);
+  const int M = coords1.size(1);
+  const int H = coords1.size(3);
+  const int W = coords1.size(4);
+  const int C = fmap1.size(2);
+  const int H2a = fmap2a.size(3);
+  const int W2a = fmap2a.size(4);
+  const int H2b = fmap2b.size(3);
+  const int W2b = fmap2b.size(4);
+
+  int n = blockIdx.x;
+  const int j0 = n % W; n /= W;
+  const int i0 = n % H; n /= H;
+  const int m = n % M; n /= M;
+  const int b = n;
+
+  const int ix = us[m];
+  const int jx = vs[m];
+
+  extern __shared__ float shared[];
+  float* f1 = shared;
+  float* raw = shared + C;
+
+  for (int c = threadIdx.x; c < C; c += blockDim.x) {
+    f1[c] = static_cast<float>(fmap1[b][ix][c][i0][j0]);
+  }
+
+  __syncthreads();
+
+  const int raw_size = 2 * D * D;
+  for (int t = threadIdx.x; t < raw_size; t += blockDim.x) {
+    const int level = t / (D * D);
+    const int r = t - level * D * D;
+    const int jj = r % D;
+    const int ii = r / D;
+
+    const float x = level == 0 ? coords1[b][m][0][i0][j0] : coords2[b][m][0][i0][j0];
+    const float y = level == 0 ? coords1[b][m][1][i0][j0] : coords2[b][m][1][i0][j0];
+    const int i1 = static_cast<int>(floorf(y)) + (ii - R);
+    const int j1 = static_cast<int>(floorf(x)) + (jj - R);
+
+    float s = 0.0f;
+    if (level == 0) {
+      if (within_bounds(i1, j1, H2a, W2a)) {
+        #pragma unroll 8
+        for (int c = 0; c < C; c++) {
+          s += f1[c] * static_cast<float>(fmap2a[b][jx][c][i1][j1]);
+        }
+      }
+    } else {
+      if (within_bounds(i1, j1, H2b, W2b)) {
+        #pragma unroll 8
+        for (int c = 0; c < C; c++) {
+          s += f1[c] * static_cast<float>(fmap2b[b][jx][c][i1][j1]);
+        }
+      }
+    }
+
+    raw[t] = s;
+  }
+
+  __syncthreads();
+
+  const int out_size = 2 * d * d;
+  for (int t = threadIdx.x; t < out_size; t += blockDim.x) {
+    const int level = t / (d * d);
+    const int r = t - level * d * d;
+    const int v = r % d;
+    const int u = r / d;
+
+    const float x = level == 0 ? coords1[b][m][0][i0][j0] : coords2[b][m][0][i0][j0];
+    const float y = level == 0 ? coords1[b][m][1][i0][j0] : coords2[b][m][1][i0][j0];
+    const float dx = x - floorf(x);
+    const float dy = y - floorf(y);
+
+    const int base = level * D * D;
+    const float c00 = raw[base + v * D + u];
+    const float c01 = raw[base + v * D + u + 1];
+    const float c10 = raw[base + (v + 1) * D + u];
+    const float c11 = raw[base + (v + 1) * D + u + 1];
+
+    packed[b][m][u][v][i0][j0][level] = static_cast<scalar_t>(
+      (1.0f - dx) * (1.0f - dy) * c00 +
+              dx  * (1.0f - dy) * c01 +
+      (1.0f - dx) *         dy  * c10 +
+              dx  *         dy  * c11);
+  }
+}
+
 
 template <typename scalar_t>
 __global__ void corr_backward_kernel(int R,
@@ -189,7 +292,6 @@ __global__ void corr_backward_kernel(int R,
   }
 }
 
-
 std::vector<torch::Tensor> corr_cuda_forward(
   torch::Tensor fmap1,
   torch::Tensor fmap2,
@@ -230,6 +332,42 @@ std::vector<torch::Tensor> corr_cuda_forward(
   out +=     (dx) *     (dy) * corr.index({Slice(), Slice(), Slice(1, D-0), Slice(1, D-0)});
 
   return { out.permute({0,1,3,2,4,5}) };
+}
+
+std::vector<torch::Tensor> corr_pyramid_cuda_forward(
+  torch::Tensor fmap1,
+  torch::Tensor fmap2a,
+  torch::Tensor fmap2b,
+  torch::Tensor coords1,
+  torch::Tensor coords2,
+  torch::Tensor ii,
+  torch::Tensor jj,
+  int radius)
+{
+  const int B = coords1.size(0);
+  const int M = coords1.size(1);
+  const int H = coords1.size(3);
+  const int W = coords1.size(4);
+  const int D = 2 * radius + 2;
+  const int d = D - 1;
+
+  auto packed = torch::empty({B, M, d, d, H, W, 2}, fmap1.options());
+  const int C = fmap1.size(2);
+  const size_t shared_bytes = (C + 2 * D * D) * sizeof(float);
+
+  AT_DISPATCH_FLOATING_TYPES_AND_HALF(fmap1.type(), "corr_pyramid_fused_kernel", ([&] {
+      corr_pyramid_fused_kernel<scalar_t><<<B * M * H * W, THREADS, shared_bytes>>>(radius,
+        fmap1.packed_accessor32<scalar_t,5,torch::RestrictPtrTraits>(),
+        fmap2a.packed_accessor32<scalar_t,5,torch::RestrictPtrTraits>(),
+        fmap2b.packed_accessor32<scalar_t,5,torch::RestrictPtrTraits>(),
+        coords1.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
+        coords2.packed_accessor32<float,5,torch::RestrictPtrTraits>(),
+        ii.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
+        jj.packed_accessor32<long,1,torch::RestrictPtrTraits>(),
+        packed.packed_accessor32<scalar_t,7,torch::RestrictPtrTraits>());
+  }));
+
+  return { packed.view({B, M, -1}) };
 }
 
 
